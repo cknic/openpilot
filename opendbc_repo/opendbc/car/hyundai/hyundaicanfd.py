@@ -82,14 +82,19 @@ def create_suppress_lfa(packer, CAN, lfa_block_msg, lka_steering_alt):
 
 
 def create_buttons(packer, CP, CAN, cnt, btn):
+  canfd_msg = "CRUISE_BUTTONS_ALT" if CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS else \
+              "CRUISE_BUTTONS"
+  # If we discover cars use different values for this in the future, echoing back
+  # what's read from the car would also work.
+  SET_ME_2 = 6
   values = {
     "COUNTER": cnt,
-    "SET_ME_1": 1,
     "CRUISE_BUTTONS": btn,
-  }
+    "SET_ME_1": 1,
+  } | ({"SET_ME_2": SET_ME_2} if CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS else {})
 
   bus = CAN.ECAN if CP.flags & HyundaiFlags.CANFD_LKA_STEERING else CAN.CAM
-  return packer.make_can_msg("CRUISE_BUTTONS", bus, values)
+  return packer.make_can_msg(canfd_msg, bus, values)
 
 
 def create_acc_cancel(packer, CP, CAN, cruise_info_copy):
@@ -195,7 +200,9 @@ def create_fca_warning_light(packer, CAN, frame):
       'SET_ME_2': 0x2,
       'SET_ME_FF': 0xff,
       'SET_ME_FC': 0xfc,
-      'SET_ME_9': 0x9,
+      'SET_ME_9': 0x1,
+      'SET_ME_A8': 0xa8,
+      'SET_ME_10': 0x10,
     }
     ret.append(packer.make_can_msg("ADRV_0x160", CAN.ECAN, values))
   return ret
@@ -215,7 +222,7 @@ def create_adrv_messages(packer, CAN, frame):
 
   if frame % 5 == 0:
     values = {
-      'SET_ME_1C': 0x1c,
+      'SET_ME_1C': 0x8,
       'SET_ME_FF': 0xff,
       'SET_ME_TMP_F': 0xf,
       'SET_ME_TMP_F_2': 0xf,
@@ -223,14 +230,16 @@ def create_adrv_messages(packer, CAN, frame):
     ret.append(packer.make_can_msg("ADRV_0x1ea", CAN.ECAN, values))
 
     values = {
-      'SET_ME_E1': 0xe1,
-      'SET_ME_3A': 0x3a,
+      'SET_ME_E1': 0x14,
+      'SET_ME_3A': 0x80,
+      'SET_ME_2C': 0x2c,
     }
     ret.append(packer.make_can_msg("ADRV_0x200", CAN.ECAN, values))
 
   if frame % 20 == 0:
     values = {
       'SET_ME_15': 0x15,
+      'SET_ME_56': 0x56,
     }
     ret.append(packer.make_can_msg("ADRV_0x345", CAN.ECAN, values))
 
@@ -240,6 +249,13 @@ def create_adrv_messages(packer, CAN, frame):
       'SET_ME_41': 0x41,
     }
     ret.append(packer.make_can_msg("ADRV_0x1da", CAN.ECAN, values))
+
+  if frame % 20 == 0:
+    values = {
+      'SET_ME_F7': 0xf7,
+      'SET_ME_9F': 0x9f,
+    }
+    ret.append(packer.make_can_msg("ADRV_0x38C", CAN.ECAN, values))
 
   return ret
 
