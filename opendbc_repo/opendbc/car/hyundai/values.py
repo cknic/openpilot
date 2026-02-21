@@ -34,10 +34,9 @@ class CarControllerParams:
       self.STEER_DELTA_UP = 2
       self.STEER_DELTA_DOWN = 3
 
-    # These cars have been observed to do 10 Nm/sec stock. Conservatively, double their deltas (vs. CANFD).
+    # Carnival HEV: observed 10 Nm/sec stock. Keep UP at CANFD default, allow faster DOWN.
     if CP.carFingerprint in (CAR.KIA_CARNIVAL_HEV_4TH_GEN,):
-      self.STEER_DELTA_DOWN = 4
-      self.STEER_DELTA_UP = 6
+      self.STEER_DELTA_DOWN = 6
 
     # To determine the limit for your car, find the maximum value that the stock LKAS will request.
     # If the max stock LKAS request is <384, add your car to this list.
