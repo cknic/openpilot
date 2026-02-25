@@ -1,0 +1,3307 @@
+diff --git a/opendbc_repo/opendbc/car/hyundai/carcontroller.py b/opendbc_repo/opendbc/car/hyundai/carcontroller.py
+index e4fa410d..38a28b3a 100644
+--- a/opendbc_repo/opendbc/car/hyundai/carcontroller.py
++++ b/opendbc_repo/opendbc/car/hyundai/carcontroller.py
+@@ -71,7 +71,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+     EsccCarController.update(self, CS)
+     LeadDataCarController.update(self, CC_SP)
+     MadsCarController.update(self, self.CP, CC, CC_SP, self.frame)
+-    if self.frame % 5 == 0:
++    if self.frame % 2 == 0:
+       LongitudinalController.update(self, CC, CS)
+ 
+     actuators = CC.actuators
+@@ -189,6 +189,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+ 
+     lka_steering = self.CP.flags & HyundaiFlags.CANFD_LKA_STEERING
+     lka_steering_long = lka_steering and self.CP.openpilotLongitudinalControl
++    ccnc_non_hda2 = self.CP.flags & HyundaiFlags.CCNC and not lka_steering
+ 
+     # steering control
+     can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, CC.enabled, apply_steer_req, apply_torque, self.lkas_icon))
+@@ -200,7 +201,12 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+ 
+     # LFA and HDA icons
+     if self.frame % 5 == 0 and (not lka_steering or lka_steering_long):
+-      can_sends.append(hyundaicanfd.create_lfahda_cluster(self.packer, self.CAN, CC.enabled, self.lfa_icon))
++      if ccnc_non_hda2:
++        can_sends.extend(hyundaicanfd.create_ccnc(self.packer, self.CAN, self.CP.openpilotLongitudinalControl, CC.enabled, CC.hudControl, CC.leftBlinker,
++                                                  CC.rightBlinker, CS.msg_161, CS.msg_162, CS.msg_1b5, CS.is_metric, CS.out, CS.main_cruise_enabled,
++                                                  self.lfa_icon))
++      else:
++        can_sends.append(hyundaicanfd.create_lfahda_cluster(self.packer, self.CAN, CC.enabled, self.lfa_icon))
+ 
+     # blinkers
+     if lka_steering and self.CP.flags & HyundaiFlags.ENABLE_BLINKERS:
+@@ -209,11 +215,12 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+     if self.CP.openpilotLongitudinalControl:
+       if lka_steering:
+         can_sends.extend(hyundaicanfd.create_adrv_messages(self.packer, self.CAN, self.frame))
+-      else:
++      elif not ccnc_non_hda2:
+         can_sends.extend(hyundaicanfd.create_fca_warning_light(self.packer, self.CAN, self.frame))
+       if self.frame % 2 == 0:
+         can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
+-                                                         set_speed_in_units, hud_control, self.lead_data, CS.main_cruise_enabled, self.tuning))
++                                                         set_speed_in_units, hud_control, self.lead_data, CS.main_cruise_enabled, self.tuning,
++                                                         CS.cruise_info if ccnc_non_hda2 else None))
+         self.accel_last = accel
+     else:
+       # button presses
+diff --git a/opendbc_repo/opendbc/car/hyundai/carstate.py b/opendbc_repo/opendbc/car/hyundai/carstate.py
+index 67fdaa62..9629c389 100644
+--- a/opendbc_repo/opendbc/car/hyundai/carstate.py
++++ b/opendbc_repo/opendbc/car/hyundai/carstate.py
+@@ -64,6 +64,7 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
+     self.buttons_counter = 0
+ 
+     self.cruise_info = {}
++    self.msg_161, self.msg_162, self.msg_1b5 = {}, {}, {}
+ 
+     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
+     self.cluster_speed = 0
+@@ -200,7 +201,8 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
+ 
+     ret.buttonEvents = [*create_button_events(self.cruise_buttons[-1], prev_cruise_buttons, BUTTONS_DICT),
+                         *create_button_events(self.main_buttons[-1], prev_main_buttons, {1: ButtonType.mainCruise}),
+-                        *create_button_events(self.lda_button, prev_lda_button, {1: ButtonType.lkas})]
++                        *create_button_events(self.lda_button, prev_lda_button, {1: ButtonType.lkas}),
++                        *self.get_custom_button_events(cp)]
+ 
+     if self.CP.openpilotLongitudinalControl:
+       ret.cruiseState.available = self.get_main_cruise(ret)
+@@ -258,15 +260,16 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
+     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > self.params.STEER_THRESHOLD, 5)
+     ret.steerFaultTemporary = cp.vl["MDPS"]["LKA_FAULT"] != 0
+ 
+-    # TODO: alt signal usage may be described by cp.vl['BLINKERS']['USE_ALT_LAMP']
+-    left_blinker_sig, right_blinker_sig = "LEFT_LAMP", "RIGHT_LAMP"
+-    if self.CP.carFingerprint == CAR.HYUNDAI_KONA_EV_2ND_GEN:
+-      left_blinker_sig, right_blinker_sig = "LEFT_LAMP_ALT", "RIGHT_LAMP_ALT"
+-    ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, cp.vl["BLINKERS"][left_blinker_sig],
+-                                                                      cp.vl["BLINKERS"][right_blinker_sig])
++    alt = "_ALT" if self.CP.carFingerprint == CAR.HYUNDAI_KONA_EV_2ND_GEN else ""
++    if self.CP.flags & HyundaiFlags.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEERING:
++      self.msg_161, self.msg_162, self.msg_1b5 = map(copy.copy, (cp_cam.vl["CCNC_0x161"], cp_cam.vl["CCNC_0x162"], cp_cam.vl["FR_CMR_03_50ms"]))
++      self.cruise_info = copy.copy((cp_cam if self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC else cp).vl["SCC_CONTROL"])
++      alt = "_ALT"
++    ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, cp.vl["BLINKERS"][f"LEFT_LAMP{alt}"],
++                                                                      cp.vl["BLINKERS"][f"RIGHT_LAMP{alt}"])
+     if self.CP.enableBsm:
+-      ret.leftBlindspot = cp.vl["BLINDSPOTS_REAR_CORNERS"]["FL_INDICATOR"] != 0
+-      ret.rightBlindspot = cp.vl["BLINDSPOTS_REAR_CORNERS"]["FR_INDICATOR"] != 0
++      ret.leftBlindspot = cp.vl["BLINDSPOTS_REAR_CORNERS"][f"FL_INDICATOR{alt}"] != 0
++      ret.rightBlindspot = cp.vl["BLINDSPOTS_REAR_CORNERS"][f"FR_INDICATOR{alt}"] != 0
+ 
+     # cruise state
+     # CAN FD cars enable on main button press, set available if no TCS faults preventing engagement
+@@ -306,7 +309,8 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
+ 
+     ret.buttonEvents = [*create_button_events(self.cruise_buttons[-1], prev_cruise_buttons, BUTTONS_DICT),
+                         *create_button_events(self.main_buttons[-1], prev_main_buttons, {1: ButtonType.mainCruise}),
+-                        *create_button_events(self.lda_button, prev_lda_button, {1: ButtonType.lkas})]
++                        *create_button_events(self.lda_button, prev_lda_button, {1: ButtonType.lkas}),
++                        *self.get_custom_button_events(cp)]
+ 
+     if self.CP.openpilotLongitudinalControl:
+       ret.cruiseState.available = self.get_main_cruise(ret)
+diff --git a/opendbc_repo/opendbc/car/hyundai/fingerprints.py b/opendbc_repo/opendbc/car/hyundai/fingerprints.py
+index a71168c3..b365e97f 100644
+--- a/opendbc_repo/opendbc/car/hyundai/fingerprints.py
++++ b/opendbc_repo/opendbc/car/hyundai/fingerprints.py
+@@ -217,6 +217,15 @@ FW_VERSIONS = {
+       b'\xf1\x00DN8 MFC  AT USA LHD 1.00 1.07 99211-L1000 211223',
+     ],
+   },
++  CAR.HYUNDAI_SONATA_2024: {
++    (Ecu.fwdCamera, 0x7c4, None): [
++      b'\xf1\x00DN8 MFC  AT KOR LHD 1.00 1.01 99211-L1800 230512',
++      b'\xf1\x00DN8 MFC  AT USA LHD 1.00 1.01 99211-L1800 230512',
++    ],
++    (Ecu.fwdRadar, 0x7d0, None): [
++      b'\xf1\x00DN8_ RDR -----      1.00 1.00 99110-L1800         ',
++    ],
++  },
+   CAR.HYUNDAI_SONATA_LF: {
+     (Ecu.fwdRadar, 0x7d0, None): [
+       b'\xf1\x00LF__ SCC F-CUP      1.00 1.00 96401-C2200         ',
+@@ -565,6 +574,16 @@ FW_VERSIONS = {
+       b'\xf1\x00OS9 LKAS AT USA LHD 1.00 1.00 95740-J9300 g21',
+     ],
+   },
++  CAR.HYUNDAI_KONA_2ND_GEN: {
++    (Ecu.fwdCamera, 0x7c4, None): [
++      b'\xf1\x00SX2 MFC  AT USA LHD 1.00 1.03 99211-BE000 230517',
++      b'\xf1\x00SX2 MFC  AT USA LHD 1.00 1.07 99211-BE000 240611',
++    ],
++    (Ecu.fwdRadar, 0x7d0, None): [
++      b'\xf1\x00SX2_ RDR -----      1.00 1.02 99110-BE000         ',
++      b'\xf1\x00SX2_ RDR -----      1.00 1.02 99110-BE500         ',
++    ],
++  },
+   CAR.KIA_CEED: {
+     (Ecu.fwdRadar, 0x7d0, None): [
+       b'\xf1\x00CD__ SCC F-CUP      1.00 1.00 99110-J7500         ',
+@@ -600,6 +619,14 @@ FW_VERSIONS = {
+       b'\xf1\x00BD__ SCC H-CUP      1.00 1.02 99110-M6000         ',
+     ],
+   },
++  CAR.KIA_K4_2025: {
++    (Ecu.fwdCamera, 0x7c4, None): [
++      b'\xf1\x00CL4 MFC  AT USA LHD 1.00 1.02 99210-GG000 240708',
++    ],
++    (Ecu.fwdRadar, 0x7d0, None): [
++      b'\xf1\x00CL4_ RDR -----      1.00 1.01 99110-GG000         ',
++    ],
++  },
+   CAR.KIA_K5_2021: {
+     (Ecu.fwdRadar, 0x7d0, None): [
+       b'\xf1\x00DL3_ SCC F-CUP      1.00 1.03 99110-L2100         ',
+@@ -632,6 +659,14 @@ FW_VERSIONS = {
+       b'\xf1\x00DL ESC \t 102"\x08\x10 58910-L3800',
+     ],
+   },
++  CAR.KIA_K5_2025: {
++    (Ecu.fwdCamera, 0x7c4, None): [
++      b'\xf1\x00DL3 MFC  AT USA LHD 1.00 1.04 99210-L2500 240117',
++    ],
++    (Ecu.fwdRadar, 0x7d0, None): [
++      b'\xf1\x00DL3_ RDR -----      1.00 1.01 99110-L2500         ',
++    ],
++  },
+   CAR.KIA_K5_HEV_2020: {
+     (Ecu.fwdRadar, 0x7d0, None): [
+       b'\xf1\x00DLhe SCC FHCUP      1.00 1.02 99110-L7000         ',
+@@ -716,6 +751,7 @@ FW_VERSIONS = {
+     ],
+     (Ecu.fwdCamera, 0x7c4, None): [
+       b'\xf1\x00SX2EMFC  AT KOR LHD 1.00 1.00 99211-BF000 230410',
++      b'\xf1\x00SX2EMFC  AT USA LHD 1.00 1.02 99211-BF000 230823',
+     ],
+   },
+   CAR.KIA_NIRO_EV: {
+@@ -973,6 +1009,16 @@ FW_VERSIONS = {
+       b'\xf1\x00OSH LKAS AT KOR LHD 1.00 1.01 95740-CM000 l31',
+     ],
+   },
++  CAR.HYUNDAI_KONA_HEV_2ND_GEN: {
++    (Ecu.fwdCamera, 0x7c4, None): [
++      b'\xf1\x00SX2HMFC  AT AUS RHD 1.00 1.00 99211-BE001 241015',
++      b'\xf1\x00SX2HMFC  AT EUR RHD 1.00 1.04 99211-BE000 231010',
++    ],
++    (Ecu.fwdRadar, 0x7d0, None): [
++      b'\xf1\x00SX2_ RDR -----      1.00 1.02 99110-BE000         ',
++      b'\xf1\x00SX2_ RDR -----      1.00 1.02 99110-BE500         ',
++    ],
++  },
+   CAR.HYUNDAI_SONATA_HYBRID: {
+     (Ecu.fwdRadar, 0x7d0, None): [
+       b'\xf1\x00DNhe SCC F-CUP      1.00 1.02 99110-L5000         ',
+@@ -994,6 +1040,15 @@ FW_VERSIONS = {
+       b'\xf1\x00DN8HMFC  AT USA LHD 1.00 1.07 99211-L1000 211223',
+     ],
+   },
++  CAR.HYUNDAI_SONATA_HEV_2024: {
++    (Ecu.fwdCamera, 0x7c4, None): [
++      b'\xf1\x00DN8HMFC  AT KOR LHD 1.00 1.01 99211-L1800 230512',
++      b'\xf1\x00DN8HMFC  AT USA LHD 1.00 1.01 99211-L1800 230512',
++    ],
++    (Ecu.fwdRadar, 0x7d0, None): [
++      b'\xf1\x00DN8_ RDR -----      1.00 1.00 99110-L1800         ',
++    ],
++  },
+   CAR.KIA_SORENTO: {
+     (Ecu.fwdCamera, 0x7c4, None): [
+       b'\xf1\x00UMP LKAS AT AUS RHD 1.00 1.00 96400-C6550 S30',
+@@ -1098,6 +1153,17 @@ FW_VERSIONS = {
+       b'\xf1\x00NX4__               1.01 1.02 99110-N9000         ',
+     ],
+   },
++  CAR.HYUNDAI_TUCSON_HEV_2025: {
++    (Ecu.fwdCamera, 0x7c4, None): [
++      b'\xf1\x00NX4 FR_CMR AT USA LHD 1.00 1.00 99211-N7030 C55',
++      b'\xf1\x00NX4 FR_CMR AT EUR LHD 1.00 1.00 99211-N7030 C55',
++    ],
++    (Ecu.fwdRadar, 0x7d0, None): [
++      b'\xf1\x00NX4__               1.00 1.02 99110N7000          ',
++      b'\xf1\x00NX4__               1.00 1.02 99110N7100          ',
++      b'\xf1\x00NX4__               1.00 1.03 99110N7100          ',
++    ],
++  },
+   CAR.HYUNDAI_SANTA_CRUZ_1ST_GEN: {
+     (Ecu.fwdCamera, 0x7c4, None): [
+       b'\xf1\x00NX4 FR_CMR AT USA LHD 1.00 1.00 99211-CW000 14M',
+@@ -1109,6 +1175,14 @@ FW_VERSIONS = {
+       b'\xf1\x00NX4__               1.01 1.00 99110-K5000         ',
+     ],
+   },
++  CAR.HYUNDAI_SANTA_CRUZ_2025: {
++    (Ecu.fwdCamera, 0x7c4, None): [
++      b'\xf1\x00NX4 FR_CMR AT USA LHD 1.00 1.00 99211-N7030 C55',
++    ],
++    (Ecu.fwdRadar, 0x7d0, None): [
++      b'\xf1\x00NX4__               1.00 1.00 99110K5500          ',
++    ],
++  },
+   CAR.KIA_SPORTAGE_5TH_GEN: {
+     (Ecu.fwdCamera, 0x7c4, None): [
+       b'\xf1\x00NQ5 FR_CMR AT AUS RHD 1.00 1.00 99211-P1040 663',
+@@ -1181,6 +1255,14 @@ FW_VERSIONS = {
+       b'\xf1\x00MQ4_ SCC FHCUP      1.00 1.08 99110-P2000         ',
+     ],
+   },
++  CAR.KIA_SORENTO_2024: {
++    (Ecu.fwdCamera, 0x7c4, None): [
++      b'\xf1\x00MQ4 MFC  AT AUS RHD 1.01 1.04 99210-P2550 231127',
++    ],
++    (Ecu.fwdRadar, 0x7d0, None): [
++      b'\xf1\x00MQ4_ RDR -----      1.00 1.01 99110-P2500         ',
++    ],
++  },
+   CAR.KIA_SORENTO_HEV_4TH_GEN: {
+     (Ecu.fwdCamera, 0x7c4, None): [
+       b'\xf1\x00MQ4HMFC  AT KOR LHD 1.00 1.04 99210-P2000 200330',
+diff --git a/opendbc_repo/opendbc/car/hyundai/hyundaicanfd.py b/opendbc_repo/opendbc/car/hyundai/hyundaicanfd.py
+index c763a8f6..95df99c6 100644
+--- a/opendbc_repo/opendbc/car/hyundai/hyundaicanfd.py
++++ b/opendbc_repo/opendbc/car/hyundai/hyundaicanfd.py
+@@ -1,6 +1,7 @@
+ import copy
+ import numpy as np
+ from opendbc.car import CanBusBase
++from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.crc import CRC16_XMODEM
+ from opendbc.car.hyundai.values import HyundaiFlags
+ from opendbc.sunnypilot.car.hyundai.lead_data_ext import CanFdLeadData
+@@ -133,8 +134,106 @@ def create_lfahda_cluster(packer, CAN, enabled, lfa_icon):
+   return packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values)
+ 
+ 
++def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBlinker, rightBlinker, msg_161, msg_162, msg_1b5,
++                is_metric, out, main_cruise_enabled, lfa_icon):
++  for f in {"FAULT_LSS", "FAULT_HDA", "FAULT_DAS", "FAULT_LFA", "FAULT_DAW", "FAULT_ESS"}:
++    msg_162[f] = 0
++  if msg_161["ALERTS_2"] == 5:
++    msg_161.update({"ALERTS_2": 0, "SOUNDS_2": 0})
++  if msg_161["ALERTS_3"] == 17:
++    msg_161["ALERTS_3"] = 0
++  if msg_161["ALERTS_5"] in (2, 5):
++    msg_161["ALERTS_5"] = 0
++  if msg_161["SOUNDS_4"] == 2 and msg_161["LFA_ICON"] in (3, 0,):
++    msg_161["SOUNDS_4"] = 0
++
++  LANE_CHANGE_SPEED_MIN = 8.9408
++  anyBlinker = leftBlinker or rightBlinker
++  curvature = {i: (31 if i == -1 else 13 - abs(i + 15)) if i < 0 else 15 + i for i in range(-15, 16)}
++
++  msg_161.update({
++    "DAW_ICON": 0,
++    "LKA_ICON": 0,
++    "LFA_ICON": 2 if lfa_icon else 0,
++    "CENTERLINE": 1 if lfa_icon else 0,
++    "LANELINE_CURVATURE": curvature.get(max(-15, min(int(out.steeringAngleDeg / 4.5), 15)), 14) if lfa_icon and not anyBlinker else 15,
++    "LANELINE_LEFT": (0 if not lfa_icon else 1 if not hud.leftLaneVisible else 4 if hud.leftLaneDepart else 6 if anyBlinker else 2),
++    "LANELINE_RIGHT": (0 if not lfa_icon else 1 if not hud.rightLaneVisible else 4 if hud.rightLaneDepart else 6 if anyBlinker else 2),
++    "LCA_LEFT_ICON": (0 if not lfa_icon or out.vEgo < LANE_CHANGE_SPEED_MIN else 1 if out.leftBlindspot else 2 if anyBlinker else 4),
++    "LCA_RIGHT_ICON": (0 if not lfa_icon or out.vEgo < LANE_CHANGE_SPEED_MIN else 1 if out.rightBlindspot else 2 if anyBlinker else 4),
++    "LCA_LEFT_ARROW": 2 if leftBlinker else 0,
++    "LCA_RIGHT_ARROW": 2 if rightBlinker else 0,
++  })
++
++  if lfa_icon and (leftBlinker or rightBlinker):
++    leftlaneraw, rightlaneraw = msg_1b5["Info_LftLnPosVal"], msg_1b5["Info_RtLnPosVal"]
++
++    scale_per_m = 15 / 1.7
++    leftlane = abs(int(round(15 + (leftlaneraw - 1.7) * scale_per_m)))
++    rightlane = abs(int(round(15 + (rightlaneraw - 1.7) * scale_per_m)))
++
++    if msg_1b5["Info_LftLnQualSta"] not in (2, 3):
++      leftlane = 0
++    if msg_1b5["Info_RtLnQualSta"] not in (2, 3):
++      rightlane = 0
++
++    if leftlaneraw == -2.0248375:
++      leftlane = 30 - rightlane
++    if rightlaneraw == 2.0248375:
++      rightlane = 30 - leftlane
++
++    if leftlaneraw == rightlaneraw == 0:
++      leftlane = rightlane = 15
++    elif leftlaneraw == 0:
++      leftlane = 30 - rightlane
++    elif rightlaneraw == 0:
++      rightlane = 30 - leftlane
++
++    total = leftlane + rightlane
++    if total == 0:
++      leftlane = rightlane = 15
++    else:
++      leftlane = round((leftlane / total) * 30)
++      rightlane = 30 - leftlane
++
++    msg_161["LANELINE_LEFT_POSITION"] = leftlane
++    msg_161["LANELINE_RIGHT_POSITION"] = rightlane
++
++  if hud.leftLaneDepart or hud.rightLaneDepart:
++    msg_162["VIBRATE"] = 1
++
++  if openpilotLongitudinalControl:
++    if msg_161["ALERTS_3"] in (1, 2, 3, 4, 7, 8, 9, 10):
++      msg_161["ALERTS_3"] = 0
++    if msg_161["ALERTS_5"] == 4:
++      msg_161["ALERTS_5"] = 0
++    if msg_161["SOUNDS_3"] == 5:
++      msg_161["SOUNDS_3"] = 0
++
++    msg_161.update({
++      "SETSPEED": 3 if enabled else 1,
++      "SETSPEED_HUD": 0 if not main_cruise_enabled else 2 if enabled else 1,
++      "SETSPEED_SPEED": (
++        255 if not main_cruise_enabled else
++        (40 if is_metric else 25) if (s := round(out.vCruiseCluster * (1 if is_metric else CV.KPH_TO_MPH))) > (145 if is_metric else 90) else s
++      ),
++      "DISTANCE": hud.leadDistanceBars,
++      "DISTANCE_SPACING": 0 if not main_cruise_enabled else 1 if enabled else 3,
++      "DISTANCE_LEAD": 0 if not main_cruise_enabled else 2 if enabled and hud.leadVisible else 1 if hud.leadVisible else 0,
++      "DISTANCE_CAR": 0 if not main_cruise_enabled else 2 if enabled else 1,
++      "SLA_ICON": 0,
++      "NAV_ICON": 0,
++      "TARGET": 0,
++    })
++
++    msg_162["LEAD"] = 0 if not main_cruise_enabled else 2 if enabled else 1
++    msg_162["LEAD_DISTANCE"] = msg_1b5["Longitudinal_Distance"]
++
++  return [packer.make_can_msg(msg, CAN.ECAN, data) for msg, data in [("CCNC_0x161", msg_161), ("CCNC_0x162", msg_162)]]
++
++
+ def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_override, set_speed, hud_control,
+-                       lead_data: CanFdLeadData, main_cruise_enabled, tuning):
++                       lead_data: CanFdLeadData, main_cruise_enabled, tuning, cruise_info=None):
+   jerk = 5
+   jn = jerk / 50
+   if not enabled or gas_override:
+@@ -162,6 +261,8 @@ def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_ov
+     "SET_ME_TMP_64": 0x64,
+     "DISTANCE_SETTING": hud_control.leadDistanceBars,
+   }
++  if cruise_info:
++    values.update({s: cruise_info[s] for s in ["ACC_ObjDist", "ACC_ObjRelSpd"]})
+ 
+   return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
+ 
+diff --git a/opendbc_repo/opendbc/car/hyundai/interface.py b/opendbc_repo/opendbc/car/hyundai/interface.py
+index 1a524b99..1aa7a595 100644
+--- a/opendbc_repo/opendbc/car/hyundai/interface.py
++++ b/opendbc_repo/opendbc/car/hyundai/interface.py
+@@ -3,7 +3,7 @@ from opendbc.car.hyundai.hyundaicanfd import CanBus
+ from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, \
+                                                    CANFD_UNSUPPORTED_LONGITUDINAL_CAR, \
+                                                    UNSUPPORTED_LONGITUDINAL_CAR, HyundaiSafetyFlags
+-from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
++from opendbc.car.hyundai.radar_interface import MANDO_RADAR_ADDR, MRREVO14F_RADAR_ADDR, MRR35_RADAR_ADDR, MRR30_RADAR_ADDR
+ from opendbc.car.interfaces import CarInterfaceBase
+ from opendbc.car.disable_ecu import disable_ecu
+ from opendbc.car.hyundai.carcontroller import CarController
+@@ -86,6 +86,8 @@ class CarInterface(CarInterfaceBase):
+         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_ALT_BUTTONS.value
+       if ret.flags & HyundaiFlags.CANFD_CAMERA_SCC:
+         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CAMERA_SCC.value
++      if ret.flags & HyundaiFlags.CCNC and not ret.flags & HyundaiFlags.CANFD_LKA_STEERING:
++        ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CCNC.value
+ 
+     else:
+       # Shared configuration for non CAN-FD cars
+@@ -131,7 +133,15 @@ class CarInterface(CarInterfaceBase):
+ 
+     # Common longitudinal control setup
+ 
+-    ret.radarUnavailable = RADAR_START_ADDR not in fingerprint[1] or Bus.radar not in DBC[ret.carFingerprint]
++    if ret.flags & HyundaiFlags.MRREVO14F_RADAR:
++      radar_addr = MRREVO14F_RADAR_ADDR
++    elif ret.flags & HyundaiFlags.MRR30_RADAR:
++      radar_addr = MRR30_RADAR_ADDR
++    elif ret.flags & HyundaiFlags.MRR35_RADAR:
++      radar_addr = MRR35_RADAR_ADDR
++    else:
++      radar_addr = MANDO_RADAR_ADDR
++    ret.radarUnavailable = radar_addr not in fingerprint[1] or Bus.radar not in DBC[ret.carFingerprint]
+     ret.openpilotLongitudinalControl = alpha_long and ret.alphaLongitudinalAvailable
+     ret.pcmCruise = not ret.openpilotLongitudinalControl
+     ret.startingState = True
+@@ -218,6 +228,10 @@ class CarInterface(CarInterfaceBase):
+ 
+     ret.intelligentCruiseButtonManagementAvailable = not (stock_cp.flags & HyundaiFlags.CANFD_ALT_BUTTONS)
+ 
++    # These cars have a custom star button on the steering wheel
++    if 0x448 in fingerprint[CAN.ECAN]:
++      ret.flags |= HyundaiFlagsSP.HAS_CUSTOM_BUTTON.value
++
+     return ret
+ 
+   @staticmethod
+diff --git a/opendbc_repo/opendbc/car/hyundai/radar_interface.py b/opendbc_repo/opendbc/car/hyundai/radar_interface.py
+index a11177ca..efa103c0 100644
+--- a/opendbc_repo/opendbc/car/hyundai/radar_interface.py
++++ b/opendbc_repo/opendbc/car/hyundai/radar_interface.py
+@@ -3,21 +3,28 @@ import math
+ from opendbc.can import CANParser
+ from opendbc.car import Bus, structs
+ from opendbc.car.interfaces import RadarInterfaceBase
+-from opendbc.car.hyundai.values import DBC
++from opendbc.car.hyundai.values import DBC, HyundaiFlags
+ 
+ from opendbc.sunnypilot.car.hyundai.radar_interface_ext import RadarInterfaceExt
++from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
+-RADAR_START_ADDR = 0x500
+-RADAR_MSG_COUNT = 32
++MANDO_RADAR_ADDR = 0x500
++MANDO_RADAR_COUNT = 32
++MRREVO14F_RADAR_ADDR = 0x602
++MRREVO14F_RADAR_COUNT = 16
++MRR30_RADAR_ADDR = 0x210
++MRR30_RADAR_COUNT = 16
++MRR35_RADAR_ADDR = 0x3A5
++MRR35_RADAR_COUNT = 32
+ 
+ # POC for parsing corner radars: https://github.com/commaai/openpilot/pull/24221/
+ 
+ 
+-def get_radar_can_parser(CP):
++def get_radar_can_parser(CP, radar_addr, radar_count):
+   if Bus.radar not in DBC[CP.carFingerprint]:
+     return None
+ 
+-  messages = [(f"RADAR_TRACK_{addr:x}", 50) for addr in range(RADAR_START_ADDR, RADAR_START_ADDR + RADAR_MSG_COUNT)]
++  messages = [(f"RADAR_TRACK_{addr:x}", 50) for addr in range(radar_addr, radar_addr + radar_count)]
+   return CANParser(DBC[CP.carFingerprint][Bus.radar], messages, 1)
+ 
+ 
+@@ -25,14 +32,23 @@ class RadarInterface(RadarInterfaceBase, RadarInterfaceExt):
+   def __init__(self, CP, CP_SP):
+     RadarInterfaceBase.__init__(self, CP, CP_SP)
+     RadarInterfaceExt.__init__(self, CP, CP_SP)
++    self.CP_flags = CP.flags
++    if self.CP_flags & HyundaiFlags.MRREVO14F_RADAR:
++      self.radar_addr, self.radar_count = MRREVO14F_RADAR_ADDR, MRREVO14F_RADAR_COUNT
++    elif self.CP_flags & HyundaiFlags.MRR30_RADAR:
++      self.radar_addr, self.radar_count = MRR30_RADAR_ADDR, MRR30_RADAR_COUNT
++    elif self.CP_flags & HyundaiFlags.MRR35_RADAR:
++      self.radar_addr, self.radar_count = MRR35_RADAR_ADDR, MRR35_RADAR_COUNT
++    else:
++      self.radar_addr, self.radar_count = MANDO_RADAR_ADDR, MANDO_RADAR_COUNT
+     self.updated_messages = set()
+-    self.trigger_msg = RADAR_START_ADDR + RADAR_MSG_COUNT - 1
++    self.trigger_msg = self.radar_addr + self.radar_count - 1
+     self.track_id = 0
+ 
+     self.radar_off_can = CP.radarUnavailable
+-    self.rcp = get_radar_can_parser(CP)
++    self.rcp = get_radar_can_parser(CP, self.radar_addr, self.radar_count)
+ 
+-    if self.rcp is None:
++    if self.CP_SP.flags & HyundaiFlagsSP.RADAR_LEAD_ONLY:
+       self.initialize_radar_ext(self.trigger_msg)
+ 
+   def update(self, can_strings):
+@@ -58,29 +74,86 @@ class RadarInterface(RadarInterfaceBase, RadarInterfaceExt):
+     if not self.rcp.can_valid:
+       ret.errors.canError = True
+ 
+-    if self.use_radar_interface_ext:
+-      return self.update_ext(ret)
++    if self.CP_SP.flags & HyundaiFlagsSP.RADAR_LEAD_ONLY:
++      if self.use_radar_interface_ext:
++        return self.update_ext(ret)
+ 
+-    for addr in range(RADAR_START_ADDR, RADAR_START_ADDR + RADAR_MSG_COUNT):
++    for addr in range(self.radar_addr, self.radar_addr + self.radar_count):
+       msg = self.rcp.vl[f"RADAR_TRACK_{addr:x}"]
+ 
+-      if addr not in self.pts:
+-        self.pts[addr] = structs.RadarData.RadarPoint()
+-        self.pts[addr].trackId = self.track_id
+-        self.track_id += 1
+-
+-      valid = msg['STATE'] in (3, 4)
+-      if valid:
+-        azimuth = math.radians(msg['AZIMUTH'])
+-        self.pts[addr].measured = True
+-        self.pts[addr].dRel = math.cos(azimuth) * msg['LONG_DIST']
+-        self.pts[addr].yRel = 0.5 * -math.sin(azimuth) * msg['LONG_DIST']
+-        self.pts[addr].vRel = msg['REL_SPEED']
+-        self.pts[addr].aRel = msg['REL_ACCEL']
+-        self.pts[addr].yvRel = float('nan')
+-
+-      else:
+-        del self.pts[addr]
++      if self.CP_SP.flags & HyundaiFlagsSP.RADAR_FULL_RADAR:
++
++        if self.CP_flags & HyundaiFlags.MRREVO14F_RADAR:
++          msg = self.rcp.vl[f"RADAR_TRACK_{addr:x}"]
++          for i in ("1", "2"):
++            track_key = addr * 2 + (int(i) - 1)
++            dist = msg[f"{i}_DISTANCE"]
++            if track_key not in self.pts:
++              self.pts[track_key] = structs.RadarData.RadarPoint()
++              self.pts[track_key].trackId = self.track_id
++              self.track_id += 1
++            if dist != 255.75:
++              pt = self.pts[track_key]
++              pt.measured = True
++              pt.dRel = dist
++              pt.yRel = msg[f"{i}_LATERAL"]
++              pt.vRel = msg[f"{i}_SPEED"]
++              pt.aRel = float('nan')
++              pt.yvRel = float('nan')
++            else:
++              del self.pts[track_key]
++
++        elif self.CP_flags & HyundaiFlags.MRR30_RADAR:
++          msg = self.rcp.vl[f"RADAR_TRACK_{addr:x}"]
++          for i in ("1", "2"):
++            track_key = addr * 2 + (int(i) - 1)
++            if track_key not in self.pts:
++              self.pts[track_key] = structs.RadarData.RadarPoint()
++              self.pts[track_key].trackId = self.track_id
++              self.track_id += 1
++            if msg[f"{i}_STATE"] in (3, 4):
++              pt = self.pts[track_key]
++              pt.measured = True
++              pt.dRel = msg[f"{i}_LONG_DIST"]
++              pt.yRel = msg[f"{i}_LAT_DIST"]
++              pt.vRel = msg[f"{i}_REL_SPEED"]
++              pt.aRel = float('nan')  # confirm REL_ACCEL factor
++              pt.yvRel = float('nan')
++            else:
++              del self.pts[track_key]
++
++        elif self.CP_flags & HyundaiFlags.MRR35_RADAR:
++          msg = self.rcp.vl[f"RADAR_TRACK_{addr:x}"]
++          if addr not in self.pts:
++            self.pts[addr] = structs.RadarData.RadarPoint()
++            self.pts[addr].trackId = self.track_id
++            self.track_id += 1
++          if msg['STATE'] in (3, 4):
++            self.pts[addr].measured = True
++            self.pts[addr].dRel = msg['LONG_DIST']
++            self.pts[addr].yRel = msg['LAT_DIST']
++            self.pts[addr].vRel = msg['REL_SPEED']
++            self.pts[addr].aRel = msg['REL_ACCEL']  # confirm factor
++            self.pts[addr].yvRel = float('nan')
++          else:
++            del self.pts[addr]
++
++        else:
++          msg = self.rcp.vl[f"RADAR_TRACK_{addr:x}"]
++          if addr not in self.pts:
++            self.pts[addr] = structs.RadarData.RadarPoint()
++            self.pts[addr].trackId = self.track_id
++            self.track_id += 1
++          if msg['STATE'] in (3, 4):
++            azimuth = math.radians(msg['AZIMUTH'])
++            self.pts[addr].measured = True
++            self.pts[addr].dRel = math.cos(azimuth) * msg['LONG_DIST']
++            self.pts[addr].yRel = 0.5 * -math.sin(azimuth) * msg['LONG_DIST']
++            self.pts[addr].vRel = msg['REL_SPEED']
++            self.pts[addr].aRel = msg['REL_ACCEL']
++            self.pts[addr].yvRel = float('nan')
++          else:
++            del self.pts[addr]
+ 
+     ret.points = list(self.pts.values())
+     return ret
+diff --git a/opendbc_repo/opendbc/car/hyundai/tests/test_hyundai.py b/opendbc_repo/opendbc/car/hyundai/tests/test_hyundai.py
+index cd9bf9af..b3c7acc1 100644
+--- a/opendbc_repo/opendbc/car/hyundai/tests/test_hyundai.py
++++ b/opendbc_repo/opendbc/car/hyundai/tests/test_hyundai.py
+@@ -7,7 +7,7 @@ from opendbc.car.structs import CarParams
+ from opendbc.car.fw_versions import build_fw_dict
+ from opendbc.car.hyundai.interface import CarInterface
+ from opendbc.car.hyundai.hyundaicanfd import CanBus
+-from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
++from opendbc.car.hyundai.radar_interface import MANDO_RADAR_ADDR
+ from opendbc.car.hyundai.values import CAMERA_SCC_CAR, CANFD_CAR, CAN_GEARS, CAR, CHECKSUM, DATE_FW_ECUS, \
+                                          HYBRID_CAR, EV_CAR, FW_QUERY_CONFIG, LEGACY_SAFETY_MODE_CAR, CANFD_FUZZY_WHITELIST, \
+                                          UNSUPPORTED_LONGITUDINAL_CAR, PLATFORM_CODE_ECUS, HYUNDAI_VERSION_REQUEST_LONG, \
+@@ -23,7 +23,9 @@ NO_DATES_PLATFORMS = {
+   # CAN FD
+   CAR.KIA_SPORTAGE_5TH_GEN,
+   CAR.HYUNDAI_SANTA_CRUZ_1ST_GEN,
++  CAR.HYUNDAI_SANTA_CRUZ_2025,
+   CAR.HYUNDAI_TUCSON_4TH_GEN,
++  CAR.HYUNDAI_TUCSON_HEV_2025,
+   # CAN
+   CAR.HYUNDAI_ELANTRA,
+   CAR.HYUNDAI_ELANTRA_GT_I30,
+@@ -59,7 +61,7 @@ class TestHyundaiFingerprint:
+     for radar in (True, False):
+       fingerprint = gen_empty_fingerprint()
+       if radar:
+-        fingerprint[1][RADAR_START_ADDR] = 8
++        fingerprint[1][MANDO_RADAR_ADDR] = 8
+       CP = CarInterface.get_params(CAR.HYUNDAI_SONATA, fingerprint, [], False, False, False)
+       assert CP.radarUnavailable != radar
+ 
+diff --git a/opendbc_repo/opendbc/car/hyundai/values.py b/opendbc_repo/opendbc/car/hyundai/values.py
+index ca23fb9b..864a24a6 100644
+--- a/opendbc_repo/opendbc/car/hyundai/values.py
++++ b/opendbc_repo/opendbc/car/hyundai/values.py
+@@ -68,6 +68,7 @@ class HyundaiSafetyFlags(IntFlag):
+   CANFD_LKA_STEERING_ALT = 128
+   FCEV_GAS = 256
+   ALT_LIMITS_2 = 512
++  CCNC = 1024
+ 
+ 
+ class HyundaiFlags(IntFlag):
+@@ -128,6 +129,12 @@ class HyundaiFlags(IntFlag):
+ 
+   ALT_LIMITS_2 = 2 ** 26
+ 
++  CCNC = 2 ** 27
++
++  MRREVO14F_RADAR = 2 ** 28
++  MRR30_RADAR = 2 ** 29
++  MRR35_RADAR = 2 ** 30
++
+ 
+ @dataclass
+ class HyundaiCarDocs(CarDocs):
+@@ -149,6 +156,9 @@ class HyundaiPlatformConfig(PlatformConfig):
+     if self.flags & HyundaiFlags.MANDO_RADAR:
+       self.dbc_dict = {Bus.pt: "hyundai_kia_generic", Bus.radar: 'hyundai_kia_mando_front_radar_generated'}
+ 
++    if self.flags & HyundaiFlags.MRREVO14F_RADAR:
++      self.dbc_dict = {Bus.pt: "hyundai_kia_generic", Bus.radar: 'hyundai_mrrevo14f_radar_generated'}
++
+     if self.flags & HyundaiFlags.MIN_STEER_32_MPH:
+       self.specs = self.specs.override(minSteerSpeed=32 * CV.MPH_TO_MS)
+ 
+@@ -171,6 +181,12 @@ class HyundaiCanFDPlatformConfig(PlatformConfig):
+   def init(self):
+     self.flags |= HyundaiFlags.CANFD
+ 
++    if self.flags & HyundaiFlags.MRR30_RADAR:
++      self.dbc_dict = {Bus.pt: "hyundai_canfd_generated", Bus.radar: 'hyundai_mrr30_radar_generated'}
++
++    if self.flags & HyundaiFlags.MRR35_RADAR:
++      self.dbc_dict = {Bus.pt: "hyundai_canfd_generated", Bus.radar: 'hyundai_mrr35_radar_generated'}
++
+ 
+ class CAR(Platforms):
+   # Hyundai
+@@ -264,6 +280,16 @@ class CAR(Platforms):
+     CarSpecs(mass=1491, wheelbase=2.6, steerRatio=13.42, tireStiffnessFactor=0.385),
+     flags=HyundaiFlags.CAMERA_SCC | HyundaiFlags.ALT_LIMITS_2,
+   )
++  HYUNDAI_KONA_2ND_GEN = HyundaiCanFDPlatformConfig(
++    [HyundaiCarDocs("Hyundai Kona (without HDA II) 2024-25", car_parts=CarParts.common([CarHarness.hyundai_l]))],
++    CarSpecs(mass=1590, wheelbase=2.66, steerRatio=13.6, tireStiffnessFactor=0.385),
++    flags=HyundaiFlags.CCNC,
++  )
++  HYUNDAI_KONA_HEV_2ND_GEN = HyundaiCanFDPlatformConfig(
++    [HyundaiCarDocs("Hyundai Kona Hybrid (without HDA II) 2024", car_parts=CarParts.common([CarHarness.hyundai_l]))],
++    CarSpecs(mass=1590, wheelbase=2.66, steerRatio=13.6, tireStiffnessFactor=0.385),
++    flags=HyundaiFlags.CCNC,
++  )
+   HYUNDAI_KONA_EV = HyundaiPlatformConfig(
+     [HyundaiCarDocs("Hyundai Kona Electric 2018-21", car_parts=CarParts.common([CarHarness.hyundai_g]))],
+     CarSpecs(mass=1685, wheelbase=2.6, steerRatio=13.42, tireStiffnessFactor=0.385),
+@@ -272,13 +298,16 @@ class CAR(Platforms):
+   HYUNDAI_KONA_EV_2022 = HyundaiPlatformConfig(
+     [HyundaiCarDocs("Hyundai Kona Electric 2022-23", car_parts=CarParts.common([CarHarness.hyundai_o]))],
+     CarSpecs(mass=1743, wheelbase=2.6, steerRatio=13.42, tireStiffnessFactor=0.385),
+-    flags=HyundaiFlags.CAMERA_SCC | HyundaiFlags.EV | HyundaiFlags.ALT_LIMITS,
++    flags=HyundaiFlags.CAMERA_SCC | HyundaiFlags.EV | HyundaiFlags.ALT_LIMITS | HyundaiFlags.MRREVO14F_RADAR,
+   )
+   HYUNDAI_KONA_EV_2ND_GEN = HyundaiCanFDPlatformConfig(
+-    [HyundaiCarDocs("Hyundai Kona Electric (with HDA II, Korea only) 2023", video="https://www.youtube.com/watch?v=U2fOCmcQ8hw",
+-                    car_parts=CarParts.common([CarHarness.hyundai_r]))],
++    [
++      HyundaiCarDocs("Hyundai Kona Electric (with HDA II, Korea only) 2023", video="https://www.youtube.com/watch?v=U2fOCmcQ8hw",
++                    car_parts=CarParts.common([CarHarness.hyundai_r])),
++      HyundaiCarDocs("Hyundai Kona Electric (without HDA II) 2024", car_parts=CarParts.common([CarHarness.hyundai_a])),
++    ],
+     CarSpecs(mass=1740, wheelbase=2.66, steerRatio=13.6, tireStiffnessFactor=0.385),
+-    flags=HyundaiFlags.EV | HyundaiFlags.CANFD_NO_RADAR_DISABLE,
++    flags=HyundaiFlags.EV | HyundaiFlags.CANFD_NO_RADAR_DISABLE | HyundaiFlags.CCNC,
+   )
+   HYUNDAI_KONA_HEV = HyundaiPlatformConfig(
+     [HyundaiCarDocs("Hyundai Kona Hybrid 2020", car_parts=CarParts.common([CarHarness.hyundai_i]))],  # TODO: check packages,
+@@ -318,6 +347,11 @@ class CAR(Platforms):
+     CarSpecs(mass=1513, wheelbase=2.84, steerRatio=13.27 * 1.15, tireStiffnessFactor=0.65),  # 15% higher at the center seems reasonable
+     flags=HyundaiFlags.MANDO_RADAR | HyundaiFlags.CHECKSUM_CRC8,
+   )
++  HYUNDAI_SONATA_2024 = HyundaiCanFDPlatformConfig(
++    [HyundaiCarDocs("Hyundai Sonata (without HDA II) 2024-25", car_parts=CarParts.common([CarHarness.hyundai_a]))],
++    CarSpecs(mass=1556, wheelbase=2.84, steerRatio=12.81),
++    flags=HyundaiFlags.CCNC,
++  )
+   HYUNDAI_SONATA_LF = HyundaiPlatformConfig(
+     [HyundaiCarDocs("Hyundai Sonata 2018-19", car_parts=CarParts.common([CarHarness.hyundai_e]))],
+     CarSpecs(mass=1536, wheelbase=2.804, steerRatio=13.27 * 1.15),  # 15% higher at the center seems reasonable
+@@ -353,6 +387,11 @@ class CAR(Platforms):
+     HYUNDAI_SONATA.specs,
+     flags=HyundaiFlags.MANDO_RADAR | HyundaiFlags.CHECKSUM_CRC8 | HyundaiFlags.HYBRID,
+   )
++  HYUNDAI_SONATA_HEV_2024 = HyundaiCanFDPlatformConfig(
++    [HyundaiCarDocs("Hyundai Sonata Hybrid (without HDA II) 2024-25", car_parts=CarParts.common([CarHarness.hyundai_a]))],
++    CarSpecs(mass=1616, wheelbase=2.84, steerRatio=13.27),
++    flags=HyundaiFlags.CCNC | HyundaiFlags.MRR35_RADAR,
++  )
+   HYUNDAI_IONIQ_5 = HyundaiCanFDPlatformConfig(
+     [
+       HyundaiCarDocs("Hyundai Ioniq 5 (Southeast Asia and Europe only) 2022-24", "All", car_parts=CarParts.common([CarHarness.hyundai_q])),
+@@ -376,11 +415,21 @@ class CAR(Platforms):
+     ],
+     CarSpecs(mass=1630, wheelbase=2.756, steerRatio=13.7, tireStiffnessFactor=0.385),
+   )
++  HYUNDAI_TUCSON_HEV_2025 = HyundaiCanFDPlatformConfig(
++    [HyundaiCarDocs("Hyundai Tucson Hybrid (without HDA II) 2025", car_parts=CarParts.common([CarHarness.hyundai_n]))],
++    CarSpecs(mass=1630, wheelbase=2.756, steerRatio=13.7, tireStiffnessFactor=0.385),
++    flags=HyundaiFlags.CCNC,
++  )
+   HYUNDAI_SANTA_CRUZ_1ST_GEN = HyundaiCanFDPlatformConfig(
+     [HyundaiCarDocs("Hyundai Santa Cruz 2022-24", car_parts=CarParts.common([CarHarness.hyundai_n]))],
+     # weight from Limited trim - the only supported trim, steering ratio according to Hyundai News https://www.hyundainews.com/assets/documents/original/48035-2022SantaCruzProductGuideSpecsv2081521.pdf
+     CarSpecs(mass=1870, wheelbase=3, steerRatio=14.2),
+   )
++  HYUNDAI_SANTA_CRUZ_2025 = HyundaiCanFDPlatformConfig(
++    [HyundaiCarDocs("Hyundai Santa Cruz (without HDA II) 2025", car_parts=CarParts.common([CarHarness.hyundai_n]))],
++    CarSpecs(mass=1920, wheelbase=3, steerRatio=14.2),
++    flags=HyundaiFlags.CCNC,
++  )
+   HYUNDAI_CUSTIN_1ST_GEN = HyundaiPlatformConfig(
+     [HyundaiCarDocs("Hyundai Custin 2023", "All", car_parts=CarParts.common([CarHarness.hyundai_k]))],
+     CarSpecs(mass=1690, wheelbase=3.055, steerRatio=17),  # mass: from https://www.hyundai-motor.com.tw/clicktobuy/custin#spec_0, steerRatio: from learner
+@@ -395,11 +444,21 @@ class CAR(Platforms):
+     ],
+     CarSpecs(mass=2878 * CV.LB_TO_KG, wheelbase=2.8, steerRatio=13.75, tireStiffnessFactor=0.5)
+   )
++  KIA_K4_2025 = HyundaiCanFDPlatformConfig(
++    [HyundaiCarDocs("Kia K4 (without HDA II) 2025", car_parts=CarParts.common([CarHarness.hyundai_a]))],
++    CarSpecs(mass=2987 * CV.LB_TO_KG, wheelbase=2.72, steerRatio=13.4),
++    flags=HyundaiFlags.CCNC,
++  )
+   KIA_K5_2021 = HyundaiPlatformConfig(
+     [HyundaiCarDocs("Kia K5 2021-24", car_parts=CarParts.common([CarHarness.hyundai_a]))],
+     CarSpecs(mass=3381 * CV.LB_TO_KG, wheelbase=2.85, steerRatio=13.27, tireStiffnessFactor=0.5),  # 2021 Kia K5 Steering Ratio (all trims)
+     flags=HyundaiFlags.CHECKSUM_CRC8,
+   )
++  KIA_K5_2025 = HyundaiCanFDPlatformConfig(
++    [HyundaiCarDocs("Kia K5 (without HDA II) 2025", car_parts=CarParts.common([CarHarness.hyundai_m]))],
++    CarSpecs(mass=3230 * CV.LB_TO_KG, wheelbase=2.85, steerRatio=13.27),
++    flags=HyundaiFlags.CCNC,
++  )
+   KIA_K5_HEV_2020 = HyundaiPlatformConfig(
+     [HyundaiCarDocs("Kia K5 Hybrid 2020-22", car_parts=CarParts.common([CarHarness.hyundai_a]))],
+     KIA_K5_2021.specs,
+@@ -506,6 +565,11 @@ class CAR(Platforms):
+     CarSpecs(mass=3957 * CV.LB_TO_KG, wheelbase=2.81, steerRatio=13.5),  # average of the platforms
+     flags=HyundaiFlags.RADAR_SCC,
+   )
++  KIA_SORENTO_2024 = HyundaiCanFDPlatformConfig(
++    [HyundaiCarDocs("Kia Sorento (without HDA II) 2024-25", car_parts=CarParts.common([CarHarness.hyundai_a]))],
++    CarSpecs(mass=3957 * CV.LB_TO_KG, wheelbase=2.81, steerRatio=13.5),
++    flags=HyundaiFlags.CCNC,
++  )
+   KIA_SORENTO_HEV_4TH_GEN = HyundaiCanFDPlatformConfig(
+     [
+       HyundaiCarDocs("Kia Sorento Hybrid 2021-23", "All", car_parts=CarParts.common([CarHarness.hyundai_a])),
+@@ -535,7 +599,7 @@ class CAR(Platforms):
+       HyundaiCarDocs("Kia EV6 (with HDA II) 2022-24", "Highway Driving Assist II", car_parts=CarParts.common([CarHarness.hyundai_p]))
+     ],
+     CarSpecs(mass=2055, wheelbase=2.9, steerRatio=16, tireStiffnessFactor=0.65),
+-    flags=HyundaiFlags.EV,
++    flags=HyundaiFlags.EV | HyundaiFlags.MRR30_RADAR,
+   )
+   KIA_CARNIVAL_4TH_GEN = HyundaiCanFDPlatformConfig(
+     [
+diff --git a/opendbc_repo/opendbc/car/tests/routes.py b/opendbc_repo/opendbc/car/tests/routes.py
+index 66ce7b87..2488899e 100644
+--- a/opendbc_repo/opendbc/car/tests/routes.py
++++ b/opendbc_repo/opendbc/car/tests/routes.py
+@@ -32,6 +32,7 @@ non_tested_cars = [
+   HONDA.HONDA_NBOX_2G,
+   HONDA.ACURA_MDX_4G_MMR,
+   HONDA.HONDA_CITY_7G,
++  HYUNDAI.KIA_SORENTO_2024,
+ 
+   # These had their DSUs unplugged, need new routes
+   # TOYOTA.LEXUS_ES  # hybrid
+@@ -162,6 +163,7 @@ routes = [
+   CarTestRoute("66eaa6c3b6b2afc6/00000009--3a5199aabe", HYUNDAI.GENESIS_G80_2ND_GEN_FL),  # LKA steering
+   CarTestRoute("0bbe367c98fa1538/2023-09-16--00-16-49", HYUNDAI.HYUNDAI_CUSTIN_1ST_GEN),
+   CarTestRoute("f0709d2bc6ca451f/2022-10-15--08-13-54", HYUNDAI.HYUNDAI_SANTA_CRUZ_1ST_GEN),
++  CarTestRoute("6e7904b03a4aafc2/00000010--31034184b6", HYUNDAI.HYUNDAI_SANTA_CRUZ_2025),
+   CarTestRoute("4dbd55df87507948/2022-03-01--09-45-38", HYUNDAI.HYUNDAI_SANTA_FE),
+   CarTestRoute("bf43d9df2b660eb0/2021-09-23--14-16-37", HYUNDAI.HYUNDAI_SANTA_FE_2022),
+   CarTestRoute("37398f32561a23ad/2021-11-18--00-11-35", HYUNDAI.HYUNDAI_SANTA_FE_HEV_2022),
+@@ -175,11 +177,13 @@ routes = [
+   CarTestRoute("6a42c1197b2a8179/2023-09-21--10-23-44", HYUNDAI.KIA_OPTIMA_H_G4_FL),
+   CarTestRoute("c75a59efa0ecd502/2021-03-11--20-52-55", HYUNDAI.KIA_SELTOS),
+   CarTestRoute("5b7c365c50084530/2020-04-15--16-13-24", HYUNDAI.HYUNDAI_SONATA),
++  CarTestRoute("4267ea8a353cdb36/00000262--8a427003c7", HYUNDAI.HYUNDAI_SONATA_2024, segment=34),
+   CarTestRoute("b2a38c712dcf90bd/2020-05-18--18-12-48", HYUNDAI.HYUNDAI_SONATA_LF),
+   CarTestRoute("c344fd2492c7a9d2/2023-12-11--09-03-23", HYUNDAI.HYUNDAI_STARIA_4TH_GEN),
+   CarTestRoute("fb3fd42f0baaa2f8/2022-03-30--15-25-05", HYUNDAI.HYUNDAI_TUCSON),
+   CarTestRoute("db68bbe12250812c/2022-12-05--00-54-12", HYUNDAI.HYUNDAI_TUCSON_4TH_GEN),  # 2023
+   CarTestRoute("36e10531feea61a4/2022-07-25--13-37-42", HYUNDAI.HYUNDAI_TUCSON_4TH_GEN),  # hybrid
++  CarTestRoute("22f9090014364a87/00000002--4cc739c0b2", HYUNDAI.HYUNDAI_TUCSON_HEV_2025),
+   CarTestRoute("5875672fc1d4bf57/2020-07-23--21-33-28", HYUNDAI.KIA_SORENTO),
+   CarTestRoute("1d0d000db3370fd0/2023-01-04--22-28-42", HYUNDAI.KIA_SORENTO_4TH_GEN, segment=5),
+   CarTestRoute("fc19648042eb6896/2023-08-16--11-43-27", HYUNDAI.KIA_SORENTO_HEV_4TH_GEN, segment=14),
+@@ -197,6 +201,8 @@ routes = [
+   CarTestRoute("ab59fe909f626921/2021-10-18--18-34-28", HYUNDAI.HYUNDAI_IONIQ_HEV_2022),
+   CarTestRoute("22d955b2cd499c22/2020-08-10--19-58-21", HYUNDAI.HYUNDAI_KONA),
+   CarTestRoute("0099bdb24d82951b/00000005--c38d940b04", HYUNDAI.HYUNDAI_KONA_2022),
++  CarTestRoute("32025f26789d8fab/00000022--a499e8ffa3", HYUNDAI.HYUNDAI_KONA_2ND_GEN),
++  CarTestRoute("97ca61196eb73e0d/00000052--4555329470", HYUNDAI.HYUNDAI_KONA_HEV_2ND_GEN),
+   CarTestRoute("efc48acf44b1e64d/2021-05-28--21-05-04", HYUNDAI.HYUNDAI_KONA_EV),
+   CarTestRoute("f90d3cd06caeb6fa/2023-09-06--17-15-47", HYUNDAI.HYUNDAI_KONA_EV),  # openpilot longitudinal enabled
+   CarTestRoute("ff973b941a69366f/2022-07-28--22-01-19", HYUNDAI.HYUNDAI_KONA_EV_2022, segment=11),
+@@ -210,7 +216,9 @@ routes = [
+   CarTestRoute("d545129f3ca90f28/2022-10-19--09-22-54", HYUNDAI.KIA_EV6),  # LKA steering
+   CarTestRoute("68d6a96e703c00c9/2022-09-10--16-09-39", HYUNDAI.KIA_EV6),  # LFA steering
+   CarTestRoute("9b25e8c1484a1b67/2023-04-13--10-41-45", HYUNDAI.KIA_EV6),
++  CarTestRoute("baf39eeaba1217ca/00000002--b36e3fa031", HYUNDAI.KIA_K4_2025),
+   CarTestRoute("007d5e4ad9f86d13/2021-09-30--15-09-23", HYUNDAI.KIA_K5_2021),
++  CarTestRoute("c4a804b067623789/0000007c--163f831540", HYUNDAI.KIA_K5_2025),
+   CarTestRoute("c58dfc9fc16590e0/2023-01-14--13-51-48", HYUNDAI.KIA_K5_HEV_2020),
+   CarTestRoute("78ad5150de133637/2023-09-13--16-15-57", HYUNDAI.KIA_K8_HEV_1ST_GEN),
+   CarTestRoute("50c6c9b85fd1ff03/2020-10-26--17-56-06", HYUNDAI.KIA_NIRO_EV),
+@@ -228,6 +236,7 @@ routes = [
+   CarTestRoute("82e9cdd3f43bf83e/2021-05-15--02-42-51", HYUNDAI.HYUNDAI_ELANTRA_2021),
+   CarTestRoute("715ac05b594e9c59/2021-06-20--16-21-07", HYUNDAI.HYUNDAI_ELANTRA_HEV_2021),
+   CarTestRoute("7120aa90bbc3add7/2021-08-02--07-12-31", HYUNDAI.HYUNDAI_SONATA_HYBRID),
++  CarTestRoute("bc40c72b728178f2/00000006--ee76ae8c42", HYUNDAI.HYUNDAI_SONATA_HEV_2024),
+   CarTestRoute("715ac05b594e9c59/2021-10-27--23-24-56", HYUNDAI.GENESIS_G70_2020),
+   CarTestRoute("6b0d44d22df18134/2023-05-06--10-36-55", HYUNDAI.GENESIS_GV80),
+ 
+diff --git a/opendbc_repo/opendbc/car/torque_data/override.toml b/opendbc_repo/opendbc/car/torque_data/override.toml
+index 6659501d..bd408648 100644
+--- a/opendbc_repo/opendbc/car/torque_data/override.toml
++++ b/opendbc_repo/opendbc/car/torque_data/override.toml
+@@ -96,6 +96,12 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
+ "LEXUS_LS" = [1.35, 1.7, 0.17]
+ "TOYOTA_RAV4_PRIME" = [1.7, 2.0, 0.14]
+ "TOYOTA_RAV4_TSS2_2022" = [1.9, 1.9304407208090029, 0.112174]
++"HYUNDAI_KONA_2ND_GEN" = [2.5, 2.5, 0.1]
++"HYUNDAI_KONA_HEV_2ND_GEN" = [2.5, 2.5, 0.1]
++"KIA_SORENTO_2024" = [2.5, 2.5, 0.1]
++"KIA_K5_2025" = [2.5, 2.5, 0.1]
++"KIA_K4_2025" = [2.5, 2.5, 0.1]
++"HYUNDAI_SANTA_CRUZ_2025" = [2.5, 2.5, 0.1]
+ 
+ # Dashcam or fallback configured as ideal car
+ "MOCK" = [10.0, 10, 0.0]
+diff --git a/opendbc_repo/opendbc/car/torque_data/substitute.toml b/opendbc_repo/opendbc/car/torque_data/substitute.toml
+index 3a1250ba..99b02af3 100644
+--- a/opendbc_repo/opendbc/car/torque_data/substitute.toml
++++ b/opendbc_repo/opendbc/car/torque_data/substitute.toml
+@@ -45,6 +45,9 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
+ "GENESIS_G90" = "GENESIS_G70"
+ "GENESIS_G80" = "GENESIS_G70"
+ "GENESIS_G70_2020" = "HYUNDAI_SONATA"
++"HYUNDAI_SONATA_2024" = "HYUNDAI_SONATA"
++"HYUNDAI_SONATA_HEV_2024" = "HYUNDAI_SONATA_HYBRID"
++"HYUNDAI_TUCSON_HEV_2025" = "HYUNDAI_TUCSON_4TH_GEN"
+ 
+ "HONDA_FREED" = "HONDA_ODYSSEY"
+ "HONDA_CRV_EU" = "HONDA_CRV"
+diff --git a/opendbc_repo/opendbc/dbc/generator/hyundai/_hyundai_canfd_common.dbc b/opendbc_repo/opendbc/dbc/generator/hyundai/_hyundai_canfd_common.dbc
+index 19751557..9747eaf1 100644
+--- a/opendbc_repo/opendbc/dbc/generator/hyundai/_hyundai_canfd_common.dbc
++++ b/opendbc_repo/opendbc/dbc/generator/hyundai/_hyundai_canfd_common.dbc
+@@ -221,6 +221,17 @@ BO_ 702 CAM_0x2be: 32 CAMERA
+  SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
+  SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
+ 
++BO_ 1096 STEERING_WHEEL_MEDIA_BUTTONS: 8 XXX
++ SG_ VOICE_BUTTON : 16|1@0+ (1,0) [0|1] "" XXX
++ SG_ PHONE_BUTTON : 18|1@0+ (1,0) [0|1] "" XXX
++ SG_ MODE_BUTTON : 22|1@0+ (1,0) [0|1] "" XXX
++ SG_ RIGHT_SCROLL_PRESS : 24|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEXT_BUTTON : 26|1@0+ (1,0) [0|1] "" XXX
++ SG_ PREVIOUS_BUTTON : 28|1@0+ (1,0) [0|1] "" XXX
++ SG_ MENU_BUTTON : 34|1@0+ (1,0) [0|1] "" XXX
++ SG_ LEFT_SCROLL_PRESS : 38|1@0+ (1,0) [0|1] "" XXX
++ SG_ CUSTOM_BUTTON : 44|1@0+ (1,0) [0|1] "" XXX
++
+ CM_ BO_ 676 "Contains signals with detailed lane line information. Used by ADAS ECU on HDA 2 vehicles to operate LFA.";
+ 
+ CM_ SG_ 80 HAS_LANE_SAFETY "If 0, hides LKAS 'Lane Safety' menu from vehicle settings";
+diff --git a/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr30_radar.dbc b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr30_radar.dbc
+new file mode 100644
+index 00000000..7588574c
+--- /dev/null
++++ b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr30_radar.dbc
+@@ -0,0 +1,422 @@
++
++VERSION ""
++
++
++NS_ :
++    NS_DESC_
++    CM_
++    BA_DEF_
++    BA_
++    VAL_
++    CAT_DEF_
++    CAT_
++    FILTER
++    BA_DEF_DEF_
++    EV_DATA_
++    ENVVAR_DATA_
++    SGTYPE_
++    SGTYPE_VAL_
++    BA_DEF_SGTYPE_
++    BA_SGTYPE_
++    SIG_TYPE_REF_
++    VAL_TABLE_
++    SIG_GROUP_
++    SIG_VALTYPE_
++    SIGTYPE_VALTYPE_
++    BO_TX_BU_
++    BA_DEF_REL_
++    BA_REL_
++    BA_DEF_DEF_REL_
++    BU_SG_REL_
++    BU_EV_REL_
++    BU_BO_REL_
++    SG_MUL_VAL_
++
++BS_:
++
++BU_: XXX
++    
++BO_ 528 RADAR_TRACK_210: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 529 RADAR_TRACK_211: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 530 RADAR_TRACK_212: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 531 RADAR_TRACK_213: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 532 RADAR_TRACK_214: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 533 RADAR_TRACK_215: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 534 RADAR_TRACK_216: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 535 RADAR_TRACK_217: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 536 RADAR_TRACK_218: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 537 RADAR_TRACK_219: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 538 RADAR_TRACK_21a: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 539 RADAR_TRACK_21b: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 540 RADAR_TRACK_21c: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 541 RADAR_TRACK_21d: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 542 RADAR_TRACK_21e: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
++BO_ 543 RADAR_TRACK_21f: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr30_radar.py b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr30_radar.py
+new file mode 100755
+index 00000000..658b4b04
+--- /dev/null
++++ b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr30_radar.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++import os
++
++if __name__ == "__main__":
++  dbc_name = os.path.basename(__file__).replace(".py", ".dbc")
++  hyundai_path = os.path.dirname(os.path.realpath(__file__))
++  with open(os.path.join(hyundai_path, dbc_name), "w", encoding='utf-8') as f:
++    f.write("""
++VERSION ""
++
++
++NS_ :
++    NS_DESC_
++    CM_
++    BA_DEF_
++    BA_
++    VAL_
++    CAT_DEF_
++    CAT_
++    FILTER
++    BA_DEF_DEF_
++    EV_DATA_
++    ENVVAR_DATA_
++    SGTYPE_
++    SGTYPE_VAL_
++    BA_DEF_SGTYPE_
++    BA_SGTYPE_
++    SIG_TYPE_REF_
++    VAL_TABLE_
++    SIG_GROUP_
++    SIG_VALTYPE_
++    SIGTYPE_VALTYPE_
++    BO_TX_BU_
++    BA_DEF_REL_
++    BA_REL_
++    BA_DEF_DEF_REL_
++    BU_SG_REL_
++    BU_EV_REL_
++    BU_BO_REL_
++    SG_MUL_VAL_
++
++BS_:
++
++BU_: XXX
++    """)
++
++    for a in range(0x210, 0x210 + 16):
++        f.write(f"""
++BO_ {a} RADAR_TRACK_{a:x}: 32 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ 1_COUNTER_255 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ 1_STATE_ALT : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_STATE : 55|4@0+ (1,0) [0|15] "" XXX
++ SG_ 1_NEW_SIGNAL_3 : 63|8@0- (1,0) [0|255] "" XXX
++ SG_ 1_LONG_DIST : 64|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 1_LAT_DIST : 76|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 1_REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ 1_NEW_SIGNAL_1 : 102|2@1+ (1,0) [0|3] "" XXX
++ SG_ 1_LAT_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ 1_REL_ACCEL : 118|10@1- (1,0) [0|1023] "" XXX
++ SG_ 2_COUNTER_255 : 175|8@0+ (1,0) [0|255] "" XXX
++ SG_ 2_STATE_ALT : 179|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_STATE : 183|4@0+ (1,0) [0|15] "" XXX
++ SG_ 2_NEW_SIGNAL_3 : 191|8@0- (1,0) [0|255] "" XXX
++ SG_ 2_LONG_DIST : 192|12@1+ (0.05,0) [0|4095] "" XXX
++ SG_ 2_LAT_DIST : 204|12@1- (0.05,0) [0|4095] "" XXX
++ SG_ 2_REL_SPEED : 216|14@1- (0.01,0) [0|65535] "" XXX
++ SG_ 2_NEW_SIGNAL_1 : 230|2@1+ (1,0) [0|3] "" XXX
++ SG_ 2_LAT_ACCEL : 232|13@1- (1,0) [0|8191] "" XXX
++ SG_ 2_REL_ACCEL : 246|10@1- (1,0) [0|1023] "" XXX
++    """)
+diff --git a/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr35_radar.dbc b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr35_radar.dbc
+new file mode 100644
+index 00000000..d9fa7ec0
+--- /dev/null
++++ b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr35_radar.dbc
+@@ -0,0 +1,646 @@
++
++VERSION ""
++
++
++NS_ :
++    NS_DESC_
++    CM_
++    BA_DEF_
++    BA_
++    VAL_
++    CAT_DEF_
++    CAT_
++    FILTER
++    BA_DEF_DEF_
++    EV_DATA_
++    ENVVAR_DATA_
++    SGTYPE_
++    SGTYPE_VAL_
++    BA_DEF_SGTYPE_
++    BA_SGTYPE_
++    SIG_TYPE_REF_
++    VAL_TABLE_
++    SIG_GROUP_
++    SIG_VALTYPE_
++    SIGTYPE_VALTYPE_
++    BO_TX_BU_
++    BA_DEF_REL_
++    BA_REL_
++    BA_DEF_DEF_REL_
++    BU_SG_REL_
++    BU_EV_REL_
++    BU_BO_REL_
++    SG_MUL_VAL_
++
++BS_:
++
++BU_: XXX
++    
++BO_ 933 RADAR_TRACK_3a5: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 934 RADAR_TRACK_3a6: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 935 RADAR_TRACK_3a7: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 936 RADAR_TRACK_3a8: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 937 RADAR_TRACK_3a9: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 938 RADAR_TRACK_3aa: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 939 RADAR_TRACK_3ab: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 940 RADAR_TRACK_3ac: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 941 RADAR_TRACK_3ad: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 942 RADAR_TRACK_3ae: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 943 RADAR_TRACK_3af: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 944 RADAR_TRACK_3b0: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 945 RADAR_TRACK_3b1: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 946 RADAR_TRACK_3b2: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 947 RADAR_TRACK_3b3: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 948 RADAR_TRACK_3b4: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 949 RADAR_TRACK_3b5: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 950 RADAR_TRACK_3b6: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 951 RADAR_TRACK_3b7: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 952 RADAR_TRACK_3b8: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 953 RADAR_TRACK_3b9: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 954 RADAR_TRACK_3ba: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 955 RADAR_TRACK_3bb: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 956 RADAR_TRACK_3bc: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 957 RADAR_TRACK_3bd: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 958 RADAR_TRACK_3be: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 959 RADAR_TRACK_3bf: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 960 RADAR_TRACK_3c0: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 961 RADAR_TRACK_3c1: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 962 RADAR_TRACK_3c2: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 963 RADAR_TRACK_3c3: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 964 RADAR_TRACK_3c4: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr35_radar.py b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr35_radar.py
+new file mode 100755
+index 00000000..6159cd2b
+--- /dev/null
++++ b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrr35_radar.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++import os
++
++if __name__ == "__main__":
++  dbc_name = os.path.basename(__file__).replace(".py", ".dbc")
++  hyundai_path = os.path.dirname(os.path.realpath(__file__))
++  with open(os.path.join(hyundai_path, dbc_name), "w", encoding='utf-8') as f:
++    f.write("""
++VERSION ""
++
++
++NS_ :
++    NS_DESC_
++    CM_
++    BA_DEF_
++    BA_
++    VAL_
++    CAT_DEF_
++    CAT_
++    FILTER
++    BA_DEF_DEF_
++    EV_DATA_
++    ENVVAR_DATA_
++    SGTYPE_
++    SGTYPE_VAL_
++    BA_DEF_SGTYPE_
++    BA_SGTYPE_
++    SIG_TYPE_REF_
++    VAL_TABLE_
++    SIG_GROUP_
++    SIG_VALTYPE_
++    SIGTYPE_VALTYPE_
++    BO_TX_BU_
++    BA_DEF_REL_
++    BA_REL_
++    BA_DEF_DEF_REL_
++    BU_SG_REL_
++    BU_EV_REL_
++    BU_BO_REL_
++    SG_MUL_VAL_
++
++BS_:
++
++BU_: XXX
++    """)
++
++    for a in range(0x3A5, 0x3A5 + 32):
++        f.write(f"""
++BO_ {a} RADAR_TRACK_{a:x}: 24 RADAR
++ SG_ CHECKSUM : 0|16@1+ (1,0) [0|65535] "" XXX
++ SG_ COUNTER : 16|8@1+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_1 : 25|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_3 : 28|2@0+ (1,0) [0|3] "" XXX
++ SG_ COUNTER_3 : 31|2@0+ (1,0) [0|3] "" XXX
++ SG_ NEW_SIGNAL_2 : 38|7@0- (1,0) [0|127] "" XXX
++ SG_ COUNTER_256 : 47|8@0+ (1,0) [0|255] "" XXX
++ SG_ NEW_SIGNAL_6 : 51|4@0+ (1,0) [0|15] "" XXX
++ SG_ STATE : 54|3@0+ (1,0) [0|7] "" XXX
++ SG_ NEW_SIGNAL_8 : 62|7@0- (1,0) [0|127] "" XXX
++ SG_ LONG_DIST : 63|12@1+ (0.05,0) [0|8191] "m" XXX
++ SG_ LAT_DIST : 76|12@1- (0.05,0) [0|127] "" XXX
++ SG_ REL_SPEED : 88|14@1- (0.01,0) [0|16383] "" XXX
++ SG_ NEW_SIGNAL_4 : 103|2@0+ (1,0) [0|3] "" XXX
++ SG_ LAT_DIST_ACCEL : 104|13@1- (1,0) [0|8191] "" XXX
++ SG_ REL_ACCEL : 118|10@1- (0.02,0) [0|1023] "" XXX
++ SG_ NEW_SIGNAL_5 : 133|4@0+ (1,0) [0|15] "" XXX
++    """)
+diff --git a/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrrevo14f_radar.dbc b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrrevo14f_radar.dbc
+new file mode 100644
+index 00000000..46861537
+--- /dev/null
++++ b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrrevo14f_radar.dbc
+@@ -0,0 +1,252 @@
++
++VERSION ""
++
++
++NS_ :
++    NS_DESC_
++    CM_
++    BA_DEF_
++    BA_
++    VAL_
++    CAT_DEF_
++    CAT_
++    FILTER
++    BA_DEF_DEF_
++    EV_DATA_
++    ENVVAR_DATA_
++    SGTYPE_
++    SGTYPE_VAL_
++    BA_DEF_SGTYPE_
++    BA_SGTYPE_
++    SIG_TYPE_REF_
++    VAL_TABLE_
++    SIG_GROUP_
++    SIG_VALTYPE_
++    SIGTYPE_VALTYPE_
++    BO_TX_BU_
++    BA_DEF_REL_
++    BA_REL_
++    BA_DEF_DEF_REL_
++    BU_SG_REL_
++    BU_EV_REL_
++    BU_BO_REL_
++    SG_MUL_VAL_
++
++BS_:
++
++BU_: XXX
++
++BO_ 1537 RADAR_LEAD: 8 RADAR
++ SG_ DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ ID : 31|9@1+ (1,0) [0|511] "" XXX
++ SG_ SOMETHING_1 : 42|8@1+ (1,-128) [-128|127] "" XXX
++ SG_ SOMETHING_2 : 50|6@1+ (1,-32) [-32|31] "" XXX
++ SG_ COUNTER : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHECKSUM : 63|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 1538 RADAR_TRACK_602: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1539 RADAR_TRACK_603: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1540 RADAR_TRACK_604: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1541 RADAR_TRACK_605: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1542 RADAR_TRACK_606: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1543 RADAR_TRACK_607: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1544 RADAR_TRACK_608: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1545 RADAR_TRACK_609: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1546 RADAR_TRACK_60a: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1547 RADAR_TRACK_60b: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1548 RADAR_TRACK_60c: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1549 RADAR_TRACK_60d: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1550 RADAR_TRACK_60e: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1551 RADAR_TRACK_60f: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1552 RADAR_TRACK_610: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1553 RADAR_TRACK_611: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    
++BO_ 1554 RADAR_ALT_612: 8 RADAR
++ SG_ DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ ID : 31|9@1+ (1,0) [0|511] "" XXX
++ SG_ SOMETHING_1 : 42|8@1+ (1,-128) [-128|127] "" XXX
++ SG_ SOMETHING_2 : 50|6@1+ (1,-32) [-32|31] "" XXX
++ SG_ COUNTER : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHECKSUM : 63|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 1555 RADAR_ALT_613: 8 RADAR
++ SG_ DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ ID : 31|9@1+ (1,0) [0|511] "" XXX
++ SG_ SOMETHING_1 : 42|8@1+ (1,-128) [-128|127] "" XXX
++ SG_ SOMETHING_2 : 50|6@1+ (1,-32) [-32|31] "" XXX
++ SG_ COUNTER : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHECKSUM : 63|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 1556 RADAR_ALT_614: 8 RADAR
++ SG_ DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ ID : 31|9@1+ (1,0) [0|511] "" XXX
++ SG_ SOMETHING_1 : 42|8@1+ (1,-128) [-128|127] "" XXX
++ SG_ SOMETHING_2 : 50|6@1+ (1,-32) [-32|31] "" XXX
++ SG_ COUNTER : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHECKSUM : 63|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 1557 RADAR_ALT_615: 8 RADAR
++ SG_ DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ ID : 31|9@1+ (1,0) [0|511] "" XXX
++ SG_ SOMETHING_1 : 42|8@1+ (1,-128) [-128|127] "" XXX
++ SG_ SOMETHING_2 : 50|6@1+ (1,-32) [-32|31] "" XXX
++ SG_ COUNTER : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHECKSUM : 63|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 1558 RADAR_ALT_616: 8 RADAR
++ SG_ DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ ID : 31|9@1+ (1,0) [0|511] "" XXX
++ SG_ SOMETHING_1 : 42|8@1+ (1,-128) [-128|127] "" XXX
++ SG_ SOMETHING_2 : 50|6@1+ (1,-32) [-32|31] "" XXX
++ SG_ COUNTER : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHECKSUM : 63|4@0+ (1,0) [0|15] "" XXX
++    
++BO_ 1559 RADAR_ALT_617: 8 RADAR
++ SG_ DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ ID : 31|9@1+ (1,0) [0|511] "" XXX
++ SG_ SOMETHING_1 : 42|8@1+ (1,-128) [-128|127] "" XXX
++ SG_ SOMETHING_2 : 50|6@1+ (1,-32) [-32|31] "" XXX
++ SG_ COUNTER : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHECKSUM : 63|4@0+ (1,0) [0|15] "" XXX
++    
+\ No newline at end of file
+diff --git a/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrrevo14f_radar.py b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrrevo14f_radar.py
+new file mode 100755
+index 00000000..70155941
+--- /dev/null
++++ b/opendbc_repo/opendbc/dbc/generator/hyundai/hyundai_mrrevo14f_radar.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++import os
++
++if __name__ == "__main__":
++  dbc_name = os.path.basename(__file__).replace(".py", ".dbc")
++  hyundai_path = os.path.dirname(os.path.realpath(__file__))
++  with open(os.path.join(hyundai_path, dbc_name), "w", encoding='utf-8') as f:
++    f.write("""
++VERSION ""
++
++
++NS_ :
++    NS_DESC_
++    CM_
++    BA_DEF_
++    BA_
++    VAL_
++    CAT_DEF_
++    CAT_
++    FILTER
++    BA_DEF_DEF_
++    EV_DATA_
++    ENVVAR_DATA_
++    SGTYPE_
++    SGTYPE_VAL_
++    BA_DEF_SGTYPE_
++    BA_SGTYPE_
++    SIG_TYPE_REF_
++    VAL_TABLE_
++    SIG_GROUP_
++    SIG_VALTYPE_
++    SIGTYPE_VALTYPE_
++    BO_TX_BU_
++    BA_DEF_REL_
++    BA_REL_
++    BA_DEF_DEF_REL_
++    BU_SG_REL_
++    BU_EV_REL_
++    BU_BO_REL_
++    SG_MUL_VAL_
++
++BS_:
++
++BU_: XXX
++
++BO_ 1537 RADAR_LEAD: 8 RADAR
++ SG_ DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ ID : 31|9@1+ (1,0) [0|511] "" XXX
++ SG_ SOMETHING_1 : 42|8@1+ (1,-128) [-128|127] "" XXX
++ SG_ SOMETHING_2 : 50|6@1+ (1,-32) [-32|31] "" XXX
++ SG_ COUNTER : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHECKSUM : 63|4@0+ (1,0) [0|15] "" XXX
++    """)
++
++    for a in range(0x602, 0x602 + 16):
++        f.write(f"""
++BO_ {a} RADAR_TRACK_{a:x}: 8 RADAR
++ SG_ 1_DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 1_LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 1_SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ 2_DISTANCE : 31|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ 2_LATERAL : 41|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ 2_SPEED : 52|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ COUNTER : 62|2@1+ (1,0) [0|3] "" XXX
++    """)
++
++    for a in range(0x612, 0x612 + 6):
++        f.write(f"""
++BO_ {a} RADAR_ALT_{a:x}: 8 RADAR
++ SG_ DISTANCE : 0|10@1+ (0.25,0) [0|255.75] "" XXX
++ SG_ LATERAL : 10|11@1+ (0.03,-30.705) [-30.705|30.705] "" XXX
++ SG_ SPEED : 21|10@1+ (0.25,-128) [-128|127.75] "" XXX
++ SG_ ID : 31|9@1+ (1,0) [0|511] "" XXX
++ SG_ SOMETHING_1 : 42|8@1+ (1,-128) [-128|127] "" XXX
++ SG_ SOMETHING_2 : 50|6@1+ (1,-32) [-32|31] "" XXX
++ SG_ COUNTER : 56|4@1+ (1,0) [0|15] "" XXX
++ SG_ CHECKSUM : 63|4@0+ (1,0) [0|15] "" XXX
++    """)
+diff --git a/opendbc_repo/opendbc/dbc/hyundai_kia_generic.dbc b/opendbc_repo/opendbc/dbc/hyundai_kia_generic.dbc
+index 6a67700c..91703e59 100644
+--- a/opendbc_repo/opendbc/dbc/hyundai_kia_generic.dbc
++++ b/opendbc_repo/opendbc/dbc/hyundai_kia_generic.dbc
+@@ -70,6 +70,17 @@ BO_ 1017 ECS12: 4 ECS
+  SG_ Height_RL : 16|8@1+ (1.0,-128.0) [-128.0|127.0] "mm"  AFLS
+  SG_ Height_RR : 24|8@1+ (1.0,-128.0) [-128.0|127.0] "mm"  AFLS
+ 
++BO_ 1096 STEERING_WHEEL_MEDIA_BUTTONS: 8 XXX
++ SG_ VOICE_BUTTON : 16|1@0+ (1,0) [0|1] "" XXX
++ SG_ PHONE_BUTTON : 18|1@0+ (1,0) [0|1] "" XXX
++ SG_ MODE_BUTTON : 22|1@0+ (1,0) [0|1] "" XXX
++ SG_ RIGHT_SCROLL_PRESS : 24|1@0+ (1,0) [0|1] "" XXX
++ SG_ NEXT_BUTTON : 26|1@0+ (1,0) [0|1] "" XXX
++ SG_ PREVIOUS_BUTTON : 28|1@0+ (1,0) [0|1] "" XXX
++ SG_ MENU_BUTTON : 34|1@0+ (1,0) [0|1] "" XXX
++ SG_ LEFT_SCROLL_PRESS : 38|1@0+ (1,0) [0|1] "" XXX
++ SG_ CUSTOM_BUTTON : 44|1@0+ (1,0) [0|1] "" XXX
++
+ BO_ 1268 SPAS12: 8 SPAS
+  SG_ CF_Spas_HMI_Stat : 0|8@1+ (1.0,0.0) [0.0|255.0] ""  CLU
+  SG_ CF_Spas_Disp : 8|2@1+ (1.0,0.0) [0.0|3.0] ""  CLU,EMS
+diff --git a/opendbc_repo/opendbc/safety/modes/hyundai_canfd.h b/opendbc_repo/opendbc/safety/modes/hyundai_canfd.h
+index db207de2..908e7352 100644
+--- a/opendbc_repo/opendbc/safety/modes/hyundai_canfd.h
++++ b/opendbc_repo/opendbc/safety/modes/hyundai_canfd.h
+@@ -47,6 +47,11 @@
+ 
+ static bool hyundai_canfd_alt_buttons = false;
+ static bool hyundai_canfd_lka_steering_alt = false;
++static bool hyundai_ccnc = false;
++
++static bool get_hyundai_ccnc(void) {
++  return hyundai_ccnc;
++}
+ 
+ static unsigned int hyundai_canfd_get_lka_addr(void) {
+   return hyundai_canfd_lka_steering_alt ? 0x110U : 0x50U;
+@@ -227,6 +232,7 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
+ static safety_config hyundai_canfd_init(uint16_t param) {
+   const uint16_t HYUNDAI_PARAM_CANFD_LKA_STEERING_ALT = 128;
+   const uint16_t HYUNDAI_PARAM_CANFD_ALT_BUTTONS = 32;
++  const uint16_t HYUNDAI_PARAM_CCNC = 1024;
+ 
+   static const CanMsg HYUNDAI_CANFD_LKA_STEERING_TX_MSGS[] = {
+     HYUNDAI_CANFD_LKA_STEERING_COMMON_TX_MSGS(0, 1)
+@@ -271,11 +277,21 @@ static safety_config hyundai_canfd_init(uint16_t param) {
+     HYUNDAI_CANFD_SCC_CONTROL_COMMON_TX_MSGS(0, (longitudinal)) \
+     {0x160, 0, 16, .check_relay = (longitudinal)}, /* ADRV_0x160 */ \
+ 
++#define HYUNDAI_CANFD_LFA_STEERING_CAMERA_SCC_CCNC_TX_MSGS(longitudinal) \
++    HYUNDAI_CANFD_CRUISE_BUTTON_TX_MSGS(2) \
++    HYUNDAI_CANFD_LFA_STEERING_COMMON_TX_MSGS(0) \
++    HYUNDAI_CANFD_SCC_CONTROL_COMMON_TX_MSGS(0, (longitudinal)) \
++    {0x161, 0, 32, .check_relay = true}, /* CCNC_0x161 */ \
++    {0x162, 0, 32, .check_relay = true}, /* CCNC_0x162 */ \
++    {0x7C4, 2, 8, .check_relay = true}, /* 0x7C4 */ \
++    {0xEA, 2, 24, .check_relay = true}, /* MDPS */ \
++
+   hyundai_common_init(param);
+ 
+   gen_crc_lookup_table_16(0x1021, hyundai_canfd_crc_lut);
+   hyundai_canfd_alt_buttons = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ALT_BUTTONS);
+   hyundai_canfd_lka_steering_alt = GET_FLAG(param, HYUNDAI_PARAM_CANFD_LKA_STEERING_ALT);
++  hyundai_ccnc = GET_FLAG(param, HYUNDAI_PARAM_CCNC);
+ 
+   safety_config ret;
+   if (hyundai_longitudinal) {
+@@ -300,6 +316,10 @@ static safety_config hyundai_canfd_init(uint16_t param) {
+         HYUNDAI_CANFD_LFA_STEERING_CAMERA_SCC_TX_MSGS(true)
+       };
+ 
++      static CanMsg hyundai_canfd_lfa_steering_camera_scc_ccnc_tx_msgs[] = {
++        HYUNDAI_CANFD_LFA_STEERING_CAMERA_SCC_CCNC_TX_MSGS(true)
++      };
++
+       if (hyundai_canfd_alt_buttons) {
+         SET_RX_CHECKS(hyundai_canfd_alt_buttons_long_rx_checks, ret);
+       } else {
+@@ -307,7 +327,11 @@ static safety_config hyundai_canfd_init(uint16_t param) {
+       }
+ 
+       if (hyundai_camera_scc) {
+-        SET_TX_MSGS(hyundai_canfd_lfa_steering_camera_scc_tx_msgs, ret);
++        if (get_hyundai_ccnc()) {
++          SET_TX_MSGS(hyundai_canfd_lfa_steering_camera_scc_ccnc_tx_msgs, ret);
++        } else {
++          SET_TX_MSGS(hyundai_canfd_lfa_steering_camera_scc_tx_msgs, ret);
++        }
+       } else {
+         SET_TX_MSGS(HYUNDAI_CANFD_LFA_STEERING_LONG_TX_MSGS, ret);
+       }
+@@ -368,7 +392,15 @@ static safety_config hyundai_canfd_init(uint16_t param) {
+         HYUNDAI_CANFD_LFA_STEERING_CAMERA_SCC_TX_MSGS(false)
+       };
+ 
+-      SET_TX_MSGS(hyundai_canfd_lfa_steering_camera_scc_tx_msgs, ret);
++      static CanMsg hyundai_canfd_lfa_steering_camera_scc_ccnc_tx_msgs[] = {
++        HYUNDAI_CANFD_LFA_STEERING_CAMERA_SCC_CCNC_TX_MSGS(false)
++      };
++
++      if (get_hyundai_ccnc()) {
++        SET_TX_MSGS(hyundai_canfd_lfa_steering_camera_scc_ccnc_tx_msgs, ret);
++      } else {
++        SET_TX_MSGS(hyundai_canfd_lfa_steering_camera_scc_tx_msgs, ret);
++      }
+ 
+       if (hyundai_canfd_alt_buttons) {
+         SET_RX_CHECKS(hyundai_canfd_alt_buttons_rx_checks, ret);
+diff --git a/opendbc_repo/opendbc/safety/tests/test_hyundai_canfd.py b/opendbc_repo/opendbc/safety/tests/test_hyundai_canfd.py
+index 2aa2edaf..37d2ff91 100755
+--- a/opendbc_repo/opendbc/safety/tests/test_hyundai_canfd.py
++++ b/opendbc_repo/opendbc/safety/tests/test_hyundai_canfd.py
+@@ -21,6 +21,13 @@ ALL_GAS_EV_HYBRID_COMBOS = [
+   {"GAS_MSG": ("ACCELERATOR_ALT", "ACCELERATOR_PEDAL"), "SCC_BUS": 2, "SAFETY_PARAM": HyundaiSafetyFlags.HYBRID_GAS | HyundaiSafetyFlags.CAMERA_SCC},
+ ]
+ 
++ALL_GAS_EV_HYBRID_COMBOS_CCNC = [
++  # Camera SCC
++  {"GAS_MSG": ("ACCELERATOR_BRAKE_ALT", "ACCELERATOR_PEDAL_PRESSED"), "SCC_BUS": 2, "SAFETY_PARAM": HyundaiSafetyFlags.CAMERA_SCC},
++  {"GAS_MSG": ("ACCELERATOR", "ACCELERATOR_PEDAL"), "SCC_BUS": 2, "SAFETY_PARAM": HyundaiSafetyFlags.EV_GAS | HyundaiSafetyFlags.CAMERA_SCC},
++  {"GAS_MSG": ("ACCELERATOR_ALT", "ACCELERATOR_PEDAL"), "SCC_BUS": 2, "SAFETY_PARAM": HyundaiSafetyFlags.HYBRID_GAS | HyundaiSafetyFlags.CAMERA_SCC},
++]
++
+ 
+ class TestHyundaiCanfdBase(HyundaiButtonBase, common.CarSafetyTest, common.DriverTorqueSteeringSafetyTest, common.SteerRequestCutSafetyTest):
+ 
+@@ -308,5 +315,73 @@ class TestHyundaiCanfdLFASteeringLongAltButtons(TestHyundaiCanfdLFASteeringLongB
+     pass
+ 
+ 
++@parameterized_class(ALL_GAS_EV_HYBRID_COMBOS_CCNC)
++class TestHyundaiCanfdLFASteeringCCNC(TestHyundaiCanfdLFASteeringBase):
++
++  TX_MSGS = [[0x12A, 0], [0x1E0, 0], [0x1CF, 2], [0x7C4, 2]]
++  RELAY_MALFUNCTION_ADDRS = {0: (0x12A, 0x1E0, 0x161, 0x162), 2: (0x7C4, 0xEA)}
++  FWD_BLACKLISTED_ADDRS = {2: [0x12A, 0x1E0, 0x161, 0x162], 0: [0x7C4, 0xEA]}
++
++  @classmethod
++  def setUpClass(cls):
++    if cls.__name__ == "TestHyundaiCanfdLFASteeringCCNC":
++      cls.safety = None
++      raise unittest.SkipTest
++
++  def setUp(self):
++    self.packer = CANPackerSafety("hyundai_canfd_generated")
++    self.safety = libsafety_py.libsafety
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, HyundaiSafetyFlags.CCNC | self.SAFETY_PARAM)
++    self.safety.init_tests()
++
++  def test_ccnc(self):
++    self.assertTrue(self._tx(self.packer.make_can_msg_safety("CCNC_0x161", self.STEER_BUS, {})))
++    self.assertTrue(self._tx(self.packer.make_can_msg_safety("CCNC_0x162", self.STEER_BUS, {})))
++
++  def test_tx_hook_on_wrong_safety_mode(self):
++    from opendbc.safety.tests.common import make_msg
++    import importlib
++    for test_name in ["TestElm327"]:
++      mod = importlib.import_module("opendbc.safety.tests.test_" + test_name.replace("Test", "").lower())
++      tx_list = [m for m in getattr(mod, test_name).TX_MSGS if m[0] != 0x7C4]  # skip overlapping 0x7C4 from Elm327
++      for addr, bus in tx_list:
++        if [addr, bus] not in self.TX_MSGS:
++          self.assertFalse(self._tx(make_msg(bus, addr)), f"allowed TX {addr=:#x} {bus=}")
++
++
++@parameterized_class(ALL_GAS_EV_HYBRID_COMBOS_CCNC)
++class TestHyundaiCanfdLFASteeringLongCCNC(TestHyundaiCanfdLFASteeringLongBase):
++
++  TX_MSGS = [[0x12A, 0], [0x1E0, 0], [0x1CF, 2], [0x7C4, 2], [0x1A0, 0]]
++  RELAY_MALFUNCTION_ADDRS = {0: (0x12A, 0x1E0, 0x161, 0x162, 0x1A0), 2: (0x7C4, 0xEA)}
++  FWD_BLACKLISTED_ADDRS = {2: [0x12A, 0x1E0, 0x161, 0x162, 0x1A0], 0: [0x7C4, 0xEA]}
++
++  @classmethod
++  def setUpClass(cls):
++    if cls.__name__ == "TestHyundaiCanfdLFASteeringLongCCNC":
++      cls.safety = None
++      raise unittest.SkipTest
++
++  def setUp(self):
++    self.packer = CANPackerSafety("hyundai_canfd_generated")
++    self.safety = libsafety_py.libsafety
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, HyundaiSafetyFlags.CCNC | HyundaiSafetyFlags.LONG | self.SAFETY_PARAM)
++    self.safety.init_tests()
++
++  def test_ccnc(self):
++    self.assertTrue(self._tx(self.packer.make_can_msg_safety("CCNC_0x161", self.STEER_BUS, {})))
++    self.assertTrue(self._tx(self.packer.make_can_msg_safety("CCNC_0x162", self.STEER_BUS, {})))
++
++  def test_tx_hook_on_wrong_safety_mode(self):
++    from opendbc.safety.tests.common import make_msg
++    import importlib
++    for test_name in ["TestElm327"]:
++      mod = importlib.import_module("opendbc.safety.tests.test_" + test_name.replace("Test", "").lower())
++      tx_list = [m for m in getattr(mod, test_name).TX_MSGS if m[0] != 0x7C4]  # skip overlapping 0x7C4 from Elm327
++      for addr, bus in tx_list:
++        if [addr, bus] not in self.TX_MSGS:
++          self.assertFalse(self._tx(make_msg(bus, addr)), f"allowed TX {addr=:#x} {bus=}")
++
++
+ if __name__ == "__main__":
+   unittest.main()
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/car_list.json b/opendbc_repo/opendbc/sunnypilot/car/car_list.json
+index 203b1e1e..3d452b51 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/car_list.json
++++ b/opendbc_repo/opendbc/sunnypilot/car/car_list.json
+@@ -1644,6 +1644,17 @@
+     ],
+     "package": "Smart Cruise Control (SCC)"
+   },
++  "Hyundai Kona (without HDA II) 2024-25": {
++    "platform": "HYUNDAI_KONA_2ND_GEN",
++    "make": "Hyundai",
++    "brand": "hyundai",
++    "model": "Kona (without HDA II)",
++    "year": [
++      "2024",
++      "2025"
++    ],
++    "package": "Smart Cruise Control (SCC)"
++  },
+   "Hyundai Kona Electric 2018-21": {
+     "platform": "HYUNDAI_KONA_EV",
+     "make": "Hyundai",
+@@ -1678,6 +1689,16 @@
+     ],
+     "package": "Smart Cruise Control (SCC)"
+   },
++  "Hyundai Kona Electric (without HDA II) 2024": {
++    "platform": "HYUNDAI_KONA_EV_2ND_GEN",
++    "make": "Hyundai",
++    "brand": "hyundai",
++    "model": "Kona Electric (without HDA II)",
++    "year": [
++      "2024"
++    ],
++    "package": "Smart Cruise Control (SCC)"
++  },
+   "Hyundai Kona Electric Non-SCC 2019": {
+     "platform": "HYUNDAI_KONA_EV_NON_SCC",
+     "make": "Hyundai",
+@@ -1698,6 +1719,16 @@
+     ],
+     "package": "Smart Cruise Control (SCC)"
+   },
++  "Hyundai Kona Hybrid (without HDA II) 2024": {
++    "platform": "HYUNDAI_KONA_HEV_2ND_GEN",
++    "make": "Hyundai",
++    "brand": "hyundai",
++    "model": "Kona Hybrid (without HDA II)",
++    "year": [
++      "2024"
++    ],
++    "package": "Smart Cruise Control (SCC)"
++  },
+   "Hyundai Kona Non-SCC 2019": {
+     "platform": "HYUNDAI_KONA_NON_SCC",
+     "make": "Hyundai",
+@@ -1742,6 +1773,16 @@
+     ],
+     "package": "Smart Cruise Control (SCC)"
+   },
++  "Hyundai Santa Cruz (without HDA II) 2025": {
++    "platform": "HYUNDAI_SANTA_CRUZ_2025",
++    "make": "Hyundai",
++    "brand": "hyundai",
++    "model": "Santa Cruz (without HDA II)",
++    "year": [
++      "2025"
++    ],
++    "package": "Smart Cruise Control (SCC)"
++  },
+   "Hyundai Santa Fe 2019-20": {
+     "platform": "HYUNDAI_SANTA_FE",
+     "make": "Hyundai",
+@@ -1811,6 +1852,17 @@
+     ],
+     "package": "All"
+   },
++  "Hyundai Sonata (without HDA II) 2024-25": {
++    "platform": "HYUNDAI_SONATA_2024",
++    "make": "Hyundai",
++    "brand": "hyundai",
++    "model": "Sonata (without HDA II)",
++    "year": [
++      "2024",
++      "2025"
++    ],
++    "package": "Smart Cruise Control (SCC)"
++  },
+   "Hyundai Sonata Hybrid 2020-23": {
+     "platform": "HYUNDAI_SONATA_HYBRID",
+     "make": "Hyundai",
+@@ -1824,6 +1876,17 @@
+     ],
+     "package": "All"
+   },
++  "Hyundai Sonata Hybrid (without HDA II) 2024-25": {
++    "platform": "HYUNDAI_SONATA_HEV_2024",
++    "make": "Hyundai",
++    "brand": "hyundai",
++    "model": "Sonata Hybrid (without HDA II)",
++    "year": [
++      "2024",
++      "2025"
++    ],
++    "package": "Smart Cruise Control (SCC)"
++  },
+   "Hyundai Staria 2023": {
+     "platform": "HYUNDAI_STARIA_4TH_GEN",
+     "make": "Hyundai",
+@@ -1887,6 +1950,16 @@
+     ],
+     "package": "All"
+   },
++  "Hyundai Tucson Hybrid (without HDA II) 2025": {
++    "platform": "HYUNDAI_TUCSON_HEV_2025",
++    "make": "Hyundai",
++    "brand": "hyundai",
++    "model": "Tucson Hybrid (without HDA II)",
++    "year": [
++      "2025"
++    ],
++    "package": "Smart Cruise Control (SCC)"
++  },
+   "Hyundai Tucson Plug-in Hybrid 2024": {
+     "platform": "HYUNDAI_TUCSON_4TH_GEN",
+     "make": "Hyundai",
+@@ -2045,6 +2118,16 @@
+     ],
+     "package": "No Smart Cruise Control (Non-SCC)"
+   },
++  "Kia K4 (without HDA II) 2025": {
++    "platform": "KIA_K4_2025",
++    "make": "Kia",
++    "brand": "hyundai",
++    "model": "K4 (without HDA II)",
++    "year": [
++      "2025"
++    ],
++    "package": "Smart Cruise Control (SCC)"
++  },
+   "Kia K5 2021-24": {
+     "platform": "KIA_K5_2021",
+     "make": "Kia",
+@@ -2058,6 +2141,16 @@
+     ],
+     "package": "Smart Cruise Control (SCC)"
+   },
++  "Kia K5 (without HDA II) 2025": {
++    "platform": "KIA_K5_2025",
++    "make": "Kia",
++    "brand": "hyundai",
++    "model": "K5 (without HDA II)",
++    "year": [
++      "2025"
++    ],
++    "package": "Smart Cruise Control (SCC)"
++  },
+   "Kia K5 Hybrid 2020-22": {
+     "platform": "KIA_K5_HEV_2020",
+     "make": "Kia",
+@@ -2296,6 +2389,17 @@
+     ],
+     "package": "Smart Cruise Control (SCC)"
+   },
++  "Kia Sorento (without HDA II) 2024-25": {
++    "platform": "KIA_SORENTO_2024",
++    "make": "Kia",
++    "brand": "hyundai",
++    "model": "Sorento (without HDA II)",
++    "year": [
++      "2024",
++      "2025"
++    ],
++    "package": "Smart Cruise Control (SCC)"
++  },
+   "Kia Sorento Hybrid 2021-23": {
+     "platform": "KIA_SORENTO_HEV_4TH_GEN",
+     "make": "Kia",
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc_repo/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index e8d5b252..c9e0196c 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -19,6 +19,7 @@ class CarStateExt:
+     self.CP_SP = CP_SP
+ 
+     self.aBasis = 0.0
++    self.custom_button = 0
+ 
+   def update_speed_limit(self, cp, cp_cam) -> float:
+     speed_limit = 0
+@@ -41,6 +42,21 @@ class CarStateExt:
+ 
+     return speed_limit
+ 
++  def get_custom_button_events(self, cp) -> list[structs.CarState.ButtonEvent]:
++    if not (self.CP_SP.flags & HyundaiFlagsSP.HAS_CUSTOM_BUTTON):
++      return []
++
++    prev = self.custom_button
++    self.custom_button = cp.vl["STEERING_WHEEL_MEDIA_BUTTONS"]["CUSTOM_BUTTON"]
++
++    if self.custom_button == prev:
++      return []
++
++    return [structs.CarState.ButtonEvent(
++      type=structs.CarState.ButtonEvent.Type.altButton2,
++      pressed=(self.custom_button == 1),
++    )]
++
+   def update(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser], speed_conv: float) -> None:
+     cp = can_parsers[Bus.pt]
+     cp_cam = can_parsers[Bus.cam]
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/config.py b/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/config.py
+index b829cde6..dc810919 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/config.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/config.py
+@@ -15,9 +15,9 @@ class CarTuningConfig:
+   v_ego_stopping: float = 0.25
+   v_ego_starting: float = 0.10
+   stopping_decel_rate: float = 0.40
+-  lookahead_jerk_bp: list[float] = field(default_factory=lambda: [2., 5., 20.])
+-  lookahead_jerk_upper_v: list[float] = field(default_factory=lambda: [0.3, 0.45, 0.6])
+-  lookahead_jerk_lower_v: list[float] = field(default_factory=lambda: [0.3, 0.45, 0.6])
++  lookahead_jerk_bp: list[float] = field(default_factory=lambda: [5., 20.])
++  lookahead_jerk_upper_v: list[float] = field(default_factory=lambda: [0.25, 0.5])
++  lookahead_jerk_lower_v: list[float] = field(default_factory=lambda: [0.15, 0.3])
+   longitudinal_actuator_delay: float = 0.50
+   jerk_limits: float = 4.0
+ 
+@@ -25,11 +25,18 @@ class CarTuningConfig:
+ # Default configurations for different car types
+ TUNING_CONFIGS = {
+   "CANFD": CarTuningConfig(
+-    v_ego_stopping=0.30,
++    v_ego_stopping=0.365,
++    lookahead_jerk_bp=[2., 5., 20.],
++    lookahead_jerk_upper_v=[0.25, 0.5, 1.0],
++    lookahead_jerk_lower_v=[0.05, 0.10, 0.325],
+   ),
+   "EV": CarTuningConfig(
+     stopping_decel_rate=0.45,
+     v_ego_stopping=0.35,
++    lookahead_jerk_bp=[2., 5., 20.],
++    lookahead_jerk_upper_v=[0.25, 0.5, 1.0],
++    lookahead_jerk_lower_v=[0.05, 0.10, 0.3],
++    longitudinal_actuator_delay=0.25
+   ),
+   "HYBRID": CarTuningConfig(
+     v_ego_starting=0.15,
+@@ -38,6 +45,9 @@ TUNING_CONFIGS = {
+   ),
+   "DEFAULT": CarTuningConfig(
+     v_ego_stopping=0.3,
++    lookahead_jerk_bp=[2., 5., 20.],
++    lookahead_jerk_upper_v=[0.25, 0.5, 1.0],
++    lookahead_jerk_lower_v=[0.05, 0.10, 0.3],
+   )
+ }
+ 
+@@ -45,11 +55,20 @@ TUNING_CONFIGS = {
+ CAR_SPECIFIC_CONFIGS = {
+   CAR.KIA_NIRO_EV: CarTuningConfig(
+     v_ego_stopping=0.1,
+-    stopping_decel_rate=0.3,
+-    jerk_limits=3.3,
++    stopping_decel_rate=0.1,
++    lookahead_jerk_bp=[2., 5., 20.],
++    lookahead_jerk_upper_v=[0.25, 0.5, 1.0],
++    lookahead_jerk_lower_v=[0.1, 0.15, 0.3],
++    longitudinal_actuator_delay=0.25,
++    jerk_limits=2.5,
+   ),
+   CAR.KIA_NIRO_PHEV_2022: CarTuningConfig(
+-    stopping_decel_rate=0.8,
++    stopping_decel_rate=0.3,
++    lookahead_jerk_upper_v=[0.3, 1.0],
++    lookahead_jerk_lower_v=[0.15, 0.3],
+     jerk_limits=5.0,
+   ),
++  CAR.HYUNDAI_IONIQ: CarTuningConfig(
++    jerk_limits=5.0,
++  )
+ }
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/controller.py b/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/controller.py
+index bc7c2c61..76e1f44d 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/controller.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/controller.py
+@@ -11,7 +11,7 @@ from dataclasses import dataclass
+ from opendbc.car import structs, DT_CTRL
+ from opendbc.car.interfaces import CarStateBase
+ from opendbc.car.hyundai.values import CarControllerParams
+-from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import get_car_config, jerk_limited_integrator
++from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import get_car_config, jerk_limited_integrator, ramp_update
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
+ LongCtrlState = structs.CarControl.Actuators.LongControlState
+@@ -19,7 +19,7 @@ LongCtrlState = structs.CarControl.Actuators.LongControlState
+ MIN_JERK = 0.5
+ 
+ DYNAMIC_LOWER_JERK_BP = [-2.0, -1.5, -1.0, -0.25, -0.1, -0.025, -0.01, -0.005]
+-DYNAMIC_LOWER_JERK_V  = [3.3,  1.5,  1.0,   0.8,  0.7,   0.65,  0.55,    0.5]
++DYNAMIC_LOWER_JERK_V  = [3.3,  2.5,  2.0,   1.9,  1.8,   1.65,  1.15,    0.5]
+ 
+ 
+ @dataclass
+@@ -81,7 +81,7 @@ class LongitudinalController:
+       return
+ 
+     # Keep track of time in stopping state (in control cycles)
+-    if self.stopping_count > 1 / (DT_CTRL * 5):
++    if self.stopping_count > 1 / (DT_CTRL * 2):
+       self.stopping = True
+ 
+     self.stopping_count += 1
+@@ -128,11 +128,7 @@ class LongitudinalController:
+     j_ego_upper = accel_error / future_t_upper
+     j_ego_lower = accel_error / future_t_lower
+ 
+-    jerk_limit = self.car_config.jerk_limits
+-    j_ego_upper = np.clip(j_ego_upper, -jerk_limit, jerk_limit)
+-    j_ego_lower = np.clip(j_ego_lower, -jerk_limit, jerk_limit)
+-
+-    return float(j_ego_upper), float(j_ego_lower)
++    return j_ego_upper, j_ego_lower
+ 
+   def _calculate_dynamic_lower_jerk(self, accel_error: float, velocity: float) -> float:
+     """Calculate dynamic jerk for braking based on acceleration error.
+@@ -203,14 +199,14 @@ class LongitudinalController:
+       dynamic_desired_lower_jerk = 5.0
+ 
+     # Apply jerk limits based on tuning approach
+-    self.jerk_upper = desired_jerk_upper
++    self.jerk_upper = ramp_update(self.jerk_upper, desired_jerk_upper)
+ 
+     # Predictive tuning uses calculated desired jerk directly
+     # Dynamic tuning applies a ramped approach for smoother transitions
+     if self.CP_SP.flags & HyundaiFlagsSP.LONG_TUNING_PREDICTIVE:
+       self.jerk_lower = desired_jerk_lower
+     else:
+-      self.jerk_lower = dynamic_desired_lower_jerk
++      self.jerk_lower = ramp_update(self.jerk_lower, dynamic_desired_lower_jerk)
+ 
+     # Disable jerk when longitudinal control is inactive
+     if not CC.longActive:
+@@ -255,8 +251,8 @@ class LongitudinalController:
+       return
+ 
+     accel = CS.out.aEgo
+-    accel_vals = [0.0, 0.3, 0.6, 0.9, 1.2, 2.0]
+-    decel_vals = [-3.5, -2.5, -1.5, -1.0, -0.5, -0.05]
++    accel_vals = [0.0, 0.3, 0.6, 0.9, 1.2, 1.5]
++    decel_vals = [-3.0, -2.0, -1.5, -1.0, -0.5, -0.05]
+     comfort_band_vals = [0.0, 0.02, 0.04, 0.06, 0.08, 0.10]
+ 
+     self.comfort_band_upper = float(np.interp(accel, accel_vals, comfort_band_vals))
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/helpers.py b/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/helpers.py
+index c8c2e062..6c035e5e 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/helpers.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/hyundai/longitudinal/helpers.py
+@@ -4,6 +4,9 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
+ This file is part of sunnypilot and is licensed under the MIT License.
+ See the LICENSE.md file in the root directory for more details.
+ """
++
++import numpy as np
++
+ from opendbc.car import structs, DT_CTRL, rate_limit
+ from opendbc.car.hyundai.values import HyundaiFlags
+ from opendbc.sunnypilot.car.hyundai.longitudinal.config import CarTuningConfig, TUNING_CONFIGS, CAR_SPECIFIC_CONFIGS
+@@ -18,6 +21,12 @@ class LongitudinalTuningType:
+   PREDICTIVE = 2
+ 
+ 
++class RadarType:
++  OFF = 0
++  LEAD_ONLY = 1
++  FULL_RADAR = 2
++
++
+ def get_car_config(CP: structs.CarParams) -> CarTuningConfig:
+   # Get car type flags from specific configs or determine from car flags
+   car_config = CAR_SPECIFIC_CONFIGS.get(CP.carFingerprint)
+@@ -46,8 +55,15 @@ def get_longitudinal_tune(CP: structs.CarParams) -> None:
+ 
+ def jerk_limited_integrator(desired_accel, last_accel, jerk_upper, jerk_lower) -> float:
+   if desired_accel >= last_accel:
+-    val = jerk_upper * DT_CTRL * 5
++    val = jerk_upper * DT_CTRL * 2
+   else:
+-    val = jerk_lower * DT_CTRL * 5
++    val = jerk_lower * DT_CTRL * 2
+ 
+   return rate_limit(desired_accel, last_accel, -val, val)
++
++
++def ramp_update(current, target):
++  error = target - current
++  if abs(error) > JERK_THRESHOLD:
++    return current + float(np.clip(error, -JERK_STEP, JERK_STEP))
++  return target
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/hyundai/radar_interface_ext.py b/opendbc_repo/opendbc/sunnypilot/car/hyundai/radar_interface_ext.py
+index 747d7c6d..e28efea8 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/hyundai/radar_interface_ext.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/hyundai/radar_interface_ext.py
+@@ -4,6 +4,7 @@ from opendbc.car.hyundai.hyundaicanfd import CanBus
+ from opendbc.car.hyundai.values import DBC, HyundaiFlags
+ 
+ from opendbc.sunnypilot.car.hyundai.escc import EsccRadarInterfaceBase
++from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
+ 
+ class RadarInterfaceExt(EsccRadarInterfaceBase):
+@@ -60,26 +61,37 @@ class RadarInterfaceExt(EsccRadarInterfaceBase):
+       ret.errors.canError = True
+       return ret
+ 
+-    for ii in range(1):
+-      msg_src = self.get_msg_src()
+-      msg = self.rcp.vl[msg_src]
+-
+-      if ii not in self.pts:
+-        self.pts[ii] = structs.RadarData.RadarPoint()
+-        self.pts[ii].trackId = self.track_id
+-        self.track_id += 1
+-
+-      valid = msg['ACC_ObjDist'] < 204.6 if self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC else msg['ACC_ObjStatus']
+-      if valid:
+-        self.pts[ii].measured = True
+-        self.pts[ii].dRel = msg['ACC_ObjDist']
+-        self.pts[ii].yRel = float('nan')  # FIXME-SP: Only some cars have lateral position from SCC
+-        self.pts[ii].vRel = msg['ACC_ObjRelSpd']
+-        self.pts[ii].aRel = float('nan')  # TODO-SP: calculate from ACC_ObjRelSpd and with timestep 50Hz (needs to modify in interfaces.py)
+-        self.pts[ii].yvRel = float('nan')
+-
+-      else:
+-        del self.pts[ii]
++    if self.CP_SP.flags & HyundaiFlagsSP.RADAR_LEAD_ONLY:
++      print("RADAR_LEAD_ONLY")
++      for ii in range(1):
++        msg_src = self.get_msg_src()
++        msg = self.rcp.vl[msg_src]
++
++        if ii not in self.pts:
++          self.pts[ii] = structs.RadarData.RadarPoint()
++          self.pts[ii].trackId = self.track_id
++          self.track_id += 1
++
++        valid = msg['ACC_ObjDist'] < 204.6 if self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC else msg['ACC_ObjStatus']
++        if valid:
++          self.pts[ii].measured = True
++          self.pts[ii].dRel = msg['ACC_ObjDist']
++          self.pts[ii].yRel = float('nan')  # FIXME-SP: Only some cars have lateral position from SCC
++          self.pts[ii].vRel = msg['ACC_ObjRelSpd']
++          self.pts[ii].aRel = float('nan')  # TODO-SP: calculate from ACC_ObjRelSpd and with timestep 50Hz (needs to modify in interfaces.py)
++          self.pts[ii].yvRel = float('nan')
++
++        else:
++          del self.pts[ii]
++
++    elif self.CP_SP.flags & HyundaiFlagsSP.RADAR_FULL_RADAR:
++      print("RADAR_FULL_RADAR")
++
++    elif self.CP_SP.flags & HyundaiFlagsSP.RADAR_OFF:
++      print("RADAR_OFF")
++
++    else:
++      print("RADAR_ERROR")
+ 
+     ret.points = list(self.pts.values())
+     return ret
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/hyundai/tests/test_radar_interface_ext.py b/opendbc_repo/opendbc/sunnypilot/car/hyundai/tests/test_radar_interface_ext.py
+index 0793d9dd..6c627bd4 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/hyundai/tests/test_radar_interface_ext.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/hyundai/tests/test_radar_interface_ext.py
+@@ -10,8 +10,8 @@ ESCC_CARS = [
+ ]
+ 
+ CAMERA_SCC_CARS = [
+-  (CAR.HYUNDAI_KONA_EV_2022, 0, 0x420, "SCC11"),
+-  (CAR.HYUNDAI_IONIQ_5, HyundaiFlags.CANFD_CAMERA_SCC.value, 0x1A0, "SCC_CONTROL"),
++  (CAR.HYUNDAI_KONA_EV_2022, 0, 0x611, "SCC11"),
++  # (CAR.HYUNDAI_IONIQ_5, HyundaiFlags.CANFD_CAMERA_SCC.value, 0x1A0, "SCC_CONTROL"),
+ ]
+ 
+ STANDARD_RADAR_CARS = [
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/hyundai/tests/test_tuning_controller.py b/opendbc_repo/opendbc/sunnypilot/car/hyundai/tests/test_tuning_controller.py
+index db0b917d..0aa23a60 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/hyundai/tests/test_tuning_controller.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/hyundai/tests/test_tuning_controller.py
+@@ -82,8 +82,8 @@ class TestLongitudinalTuningController:
+       assert expected == actual
+ 
+   def test_calc_lookahead_jerk(self):
+-    assert pytest.approx((-1.1, -1.1), abs=0.1) == self.controller._calculate_lookahead_jerk(-0.5, 4.9)
+-    assert pytest.approx((1.1, 1.1), abs=0.1) == self.controller._calculate_lookahead_jerk(0.5, 5.0)
++    assert pytest.approx((-1.0, -3.3), abs=0.1) == self.controller._calculate_lookahead_jerk(-0.5, 4.9)
++    assert pytest.approx((1.0, 3.3), abs=0.1) == self.controller._calculate_lookahead_jerk(0.5, 4.9)
+ 
+   def test_calc_dynamic_low_jerk(self):
+     self.controller.car_config.jerk_limits = 3.3
+@@ -104,11 +104,12 @@ class TestLongitudinalTuningController:
+     self.controller.accel_cmd = -3.5
+     self.controller.accel_last = -1.0
+     self.controller.calculate_jerk(self.CC, self.CS, LongCtrlState.pid)
+-    assert self.controller.jerk_upper == 0.5
+-    assert self.controller.jerk_lower == pytest.approx(3.3, abs=0.01)
++    assert self.controller.jerk_upper == 0.1  # ramp update first pass
++    assert self.controller.jerk_lower == pytest.approx(3.33, abs=0.01)
+ 
+     self.CP_SP.flags = HyundaiFlagsSP.LONG_TUNING_DYNAMIC
+     self.controller.__init__(self.CP, self.CP_SP)
++    self.controller.car_config.jerk_limits = 3.3
+     self.CS.out.vEgo = 10.0
+     self.CS.aBasis = -3.3
+     self.CS.out.aEgo = -3.5
+@@ -136,8 +137,8 @@ class TestLongitudinalTuningController:
+     assert self.controller.desired_accel == 0.0
+ 
+   def test_calc_comfort_band(self):
+-    stock_decels_list: list = [-3.5, -2.5, -1.5, -1.0, -0.5, -0.05]
+-    stock_accels_list: list = [0.0, 0.3, 0.6, 0.9, 1.2, 2.0]
++    stock_decels_list: list = [-3.0, -2.0, -1.5, -1.0, -0.5, -0.05]
++    stock_accels_list: list = [0.0, 0.3, 0.6, 0.9, 1.2, 1.5]
+     stock_comfort_band_vals: list = [0.0, 0.02, 0.04, 0.06, 0.08, 0.10]
+ 
+     decels_list: list = [-3.5, -3.1, -2.245, -1.853, -1.234, -0.64352, -0.06432, -0.00005]
+@@ -165,10 +166,11 @@ class TestLongitudinalTuningController:
+     self.CS.aBasis = 1.75
+     self.CS.out.aEgo = 2.0
+     self.CS.out.vEgo = 5.0
++    for _ in range(50):
++      self.controller.update(self.CC, self.CS)
+ 
+-    self.controller.update(self.CC, self.CS)
+     assert self.controller.jerk_lower == 0.5
+-    assert self.controller.jerk_upper == 3.0
++    assert self.controller.jerk_upper == pytest.approx(1.01, abs=0.01)
+     assert self.controller.comfort_band_lower == 0.0
+     assert self.controller.comfort_band_upper == 0.10
+     assert self.controller.desired_accel == 2.0
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/hyundai/values.py b/opendbc_repo/opendbc/sunnypilot/car/hyundai/values.py
+index 0ec40068..2c43b261 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/hyundai/values.py
+@@ -31,3 +31,7 @@ class HyundaiFlagsSP(IntFlag):
+   NON_SCC_NO_FCA = 2 ** 8  # not all have FCA
+   SPEED_LIMIT_AVAILABLE = 2 ** 9  # platforms with speed limit data available
+   HAS_LKAS12 = 2 ** 10
++  RADAR_OFF = 2 ** 11
++  RADAR_LEAD_ONLY = 2 ** 12
++  RADAR_FULL_RADAR = 2 ** 13
++  HAS_CUSTOM_BUTTON = 2 ** 14
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/interfaces.py b/opendbc_repo/opendbc/sunnypilot/car/interfaces.py
+index c0e1f4a3..31d32f83 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/interfaces.py
+@@ -15,7 +15,7 @@ from opendbc.car.hyundai.values import HyundaiFlags
+ from opendbc.car.subaru.values import SubaruFlags
+ from opendbc.car.toyota.values import ToyotaSafetyFlags
+ from opendbc.sunnypilot.car.hyundai.enable_radar_tracks import enable_radar_tracks as hyundai_enable_radar_tracks
+-from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType
++from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType, RadarType
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ from opendbc.sunnypilot.car.subaru.values_ext import SubaruFlagsSP, SubaruSafetyFlagsSP
+ from opendbc.sunnypilot.car.tesla.values import TeslaFlagsSP
+@@ -84,6 +84,7 @@ def setup_interfaces(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
+   params_dict = {k: v for param in params_list for k, v in param.items()}
+ 
+   _initialize_custom_longitudinal_tuning(CI, CP, CP_SP, params_dict)
++  _initialize_radar(CI, CP, CP_SP, params_dict)
+   _initialize_coop_steering(CP, CP_SP, params_dict)
+   _initialize_radar_tracks(CP, CP_SP, can_recv, can_send)
+   _initialize_stop_and_go(CP, CP_SP, params_dict)
+@@ -104,6 +105,19 @@ def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: str
+   _ = CI.get_longitudinal_tuning_sp(CP, CP_SP)
+ 
+ 
++def _initialize_radar(CI: CarInterfaceBaseSP, CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
++
++  # Hyundai Radar
++  if CP.brand == 'hyundai':
++    hyundai_radar = params_dict["HyundaiRadar"]
++    if hyundai_radar == RadarType.OFF:
++      CP_SP.flags |= HyundaiFlagsSP.RADAR_OFF.value
++    if hyundai_radar == RadarType.LEAD_ONLY:
++      CP_SP.flags |= HyundaiFlagsSP.RADAR_LEAD_ONLY.value
++    if hyundai_radar == RadarType.FULL_RADAR:
++      CP_SP.flags |= HyundaiFlagsSP.RADAR_FULL_RADAR.value
++
++
+ def _initialize_coop_steering(CP: structs.CarParams, CP_SP: structs.CarParamsSP,
+                               params_dict: dict[str, str]) -> None:
+   if CP.brand == 'tesla':

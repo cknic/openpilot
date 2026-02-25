@@ -1,0 +1,146 @@
+From e4a8994f1c543bdda10ba0f26e647ead3702fe5d Mon Sep 17 00:00:00 2001
+From: Farhan <farhanmdpes@gmail.com>
+Date: Thu, 5 Feb 2026 13:56:01 -0500
+Subject: [PATCH] Add ALT_BUTTONS support for LKA steering in CAN-FD safety
+
+The 2025-2026 Kia Carnival Hybrid uses LKA steering with ALT_BUTTONS
+(0x1AA instead of 0x1CF for cruise buttons). Previously, the LKA
+steering path in hyundai_canfd_init() hardcoded STD_BUTTONS RX checks,
+ignoring the ALT_BUTTONS flag. This caused safetyRxChecksInvalid and
+forced the car into dashcam mode.
+
+Changes:
+- Add CRUISE_BUTTON_ALT TX macro for 0x1AA messages
+- Add ALT_BUTTONS variants of LKA steering TX macros
+- Update TX hook to validate correct button address based on flag
+- Add ALT_BUTTONS RX checks for both longitudinal and non-longitudinal
+  LKA steering paths
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ opendbc/safety/modes/hyundai_canfd.h | 67 ++++++++++++++++++++++++----
+ 1 file changed, 59 insertions(+), 8 deletions(-)
+
+diff --git a/opendbc/safety/modes/hyundai_canfd.h b/opendbc/safety/modes/hyundai_canfd.h
+index db207de2..48d69940 100644
+--- a/opendbc/safety/modes/hyundai_canfd.h
++++ b/opendbc/safety/modes/hyundai_canfd.h
+@@ -6,6 +6,9 @@
+ #define HYUNDAI_CANFD_CRUISE_BUTTON_TX_MSGS(bus) \
+   {0x1CF, bus, 8, .check_relay = false},  /* CRUISE_BUTTON */   \
+ 
++#define HYUNDAI_CANFD_CRUISE_BUTTON_ALT_TX_MSGS(bus) \
++  {0x1AA, bus, 16, .check_relay = false},  /* CRUISE_BUTTONS_ALT */ \
++
+ #define HYUNDAI_CANFD_LKA_STEERING_COMMON_TX_MSGS(a_can, e_can) \
+   HYUNDAI_CANFD_CRUISE_BUTTON_TX_MSGS(e_can)                        \
+   {0x50,  a_can, 16, .check_relay = (a_can) == 0},  /* LKAS */      \
+@@ -16,6 +19,16 @@
+   {0x110, a_can, 32, .check_relay = (a_can) == 0},  /* LKAS_ALT */  \
+   {0x362, a_can, 32, .check_relay = (a_can) == 0},  /* CAM_0x362 */ \
+ 
++#define HYUNDAI_CANFD_LKA_STEERING_ALT_BUTTONS_COMMON_TX_MSGS(a_can, e_can) \
++  HYUNDAI_CANFD_CRUISE_BUTTON_ALT_TX_MSGS(e_can)                            \
++  {0x50,  a_can, 16, .check_relay = (a_can) == 0},  /* LKAS */              \
++  {0x2A4, a_can, 24, .check_relay = (a_can) == 0},  /* CAM_0x2A4 */         \
++
++#define HYUNDAI_CANFD_LKA_STEERING_ALT_ALT_BUTTONS_COMMON_TX_MSGS(a_can, e_can) \
++  HYUNDAI_CANFD_CRUISE_BUTTON_ALT_TX_MSGS(e_can)                                \
++  {0x110, a_can, 32, .check_relay = (a_can) == 0},  /* LKAS_ALT */              \
++  {0x362, a_can, 32, .check_relay = (a_can) == 0},  /* CAM_0x362 */             \
++
+ #define HYUNDAI_CANFD_LFA_STEERING_COMMON_TX_MSGS(e_can)  \
+   {0x12A, e_can, 16, .check_relay = (e_can) == 0},  /* LFA */            \
+   {0x1E0, e_can, 16, .check_relay = (e_can) == 0},  /* LFAHDA_CLUSTER */ \
+@@ -172,8 +185,14 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
+   }
+ 
+   // cruise buttons check
+-  if (msg->addr == 0x1cfU) {
+-    int button = msg->data[2] & 0x7U;
++  const unsigned int tx_button_addr = hyundai_canfd_alt_buttons ? 0x1aaU : 0x1cfU;
++  if (msg->addr == tx_button_addr) {
++    int button = 0;
++    if (msg->addr == 0x1cfU) {
++      button = msg->data[2] & 0x7U;
++    } else {
++      button = (msg->data[4] >> 4) & 0x7U;
++    }
+     bool is_cancel = (button == HYUNDAI_BTN_CANCEL);
+     bool is_resume = (button == HYUNDAI_BTN_RESUME);
+     bool is_set = (button == HYUNDAI_BTN_SET);
+@@ -236,6 +255,14 @@ static safety_config hyundai_canfd_init(uint16_t param) {
+     HYUNDAI_CANFD_LKA_STEERING_ALT_COMMON_TX_MSGS(0, 1)
+   };
+ 
++  static const CanMsg HYUNDAI_CANFD_LKA_STEERING_ALT_BUTTONS_TX_MSGS[] = {
++    HYUNDAI_CANFD_LKA_STEERING_ALT_BUTTONS_COMMON_TX_MSGS(0, 1)
++  };
++
++  static const CanMsg HYUNDAI_CANFD_LKA_STEERING_ALT_ALT_BUTTONS_TX_MSGS[] = {
++    HYUNDAI_CANFD_LKA_STEERING_ALT_ALT_BUTTONS_COMMON_TX_MSGS(0, 1)
++  };
++
+   static const CanMsg HYUNDAI_CANFD_LKA_STEERING_LONG_TX_MSGS[] = {
+     HYUNDAI_CANFD_LKA_STEERING_COMMON_TX_MSGS(0, 1)
+     HYUNDAI_CANFD_LFA_STEERING_COMMON_TX_MSGS(1)
+@@ -283,8 +310,15 @@ static safety_config hyundai_canfd_init(uint16_t param) {
+       static RxCheck hyundai_canfd_lka_steering_long_rx_checks[] = {
+         HYUNDAI_CANFD_STD_BUTTONS_RX_CHECKS(1)
+       };
++      static RxCheck hyundai_canfd_lka_steering_alt_buttons_long_rx_checks[] = {
++        HYUNDAI_CANFD_ALT_BUTTONS_RX_CHECKS(1)
++      };
+ 
+-      ret = BUILD_SAFETY_CFG(hyundai_canfd_lka_steering_long_rx_checks, HYUNDAI_CANFD_LKA_STEERING_LONG_TX_MSGS);
++      if (hyundai_canfd_alt_buttons) {
++        ret = BUILD_SAFETY_CFG(hyundai_canfd_lka_steering_alt_buttons_long_rx_checks, HYUNDAI_CANFD_LKA_STEERING_LONG_TX_MSGS);
++      } else {
++        ret = BUILD_SAFETY_CFG(hyundai_canfd_lka_steering_long_rx_checks, HYUNDAI_CANFD_LKA_STEERING_LONG_TX_MSGS);
++      }
+ 
+     } else {
+       // Longitudinal checks for LFA steering
+@@ -317,17 +351,34 @@ static safety_config hyundai_canfd_init(uint16_t param) {
+     if (hyundai_canfd_lka_steering) {
+       // *** LKA steering checks ***
+       // E-CAN is on bus 1, SCC messages are sent on cars with ADRV ECU.
+-      // Does not use the alt buttons message
+       static RxCheck hyundai_canfd_lka_steering_rx_checks[] = {
+         HYUNDAI_CANFD_STD_BUTTONS_RX_CHECKS(1)
+         HYUNDAI_CANFD_SCC_ADDR_CHECK(1)
+       };
+ 
+-      SET_RX_CHECKS(hyundai_canfd_lka_steering_rx_checks, ret);
+-      if (hyundai_canfd_lka_steering_alt) {
+-        SET_TX_MSGS(HYUNDAI_CANFD_LKA_STEERING_ALT_TX_MSGS, ret);
++      static RxCheck hyundai_canfd_lka_steering_alt_buttons_rx_checks[] = {
++        HYUNDAI_CANFD_ALT_BUTTONS_RX_CHECKS(1)
++        HYUNDAI_CANFD_SCC_ADDR_CHECK(1)
++      };
++
++      if (hyundai_canfd_alt_buttons) {
++        SET_RX_CHECKS(hyundai_canfd_lka_steering_alt_buttons_rx_checks, ret);
++      } else {
++        SET_RX_CHECKS(hyundai_canfd_lka_steering_rx_checks, ret);
++      }
++
++      if (hyundai_canfd_alt_buttons) {
++        if (hyundai_canfd_lka_steering_alt) {
++          SET_TX_MSGS(HYUNDAI_CANFD_LKA_STEERING_ALT_ALT_BUTTONS_TX_MSGS, ret);
++        } else {
++          SET_TX_MSGS(HYUNDAI_CANFD_LKA_STEERING_ALT_BUTTONS_TX_MSGS, ret);
++        }
+       } else {
+-        SET_TX_MSGS(HYUNDAI_CANFD_LKA_STEERING_TX_MSGS, ret);
++        if (hyundai_canfd_lka_steering_alt) {
++          SET_TX_MSGS(HYUNDAI_CANFD_LKA_STEERING_ALT_TX_MSGS, ret);
++        } else {
++          SET_TX_MSGS(HYUNDAI_CANFD_LKA_STEERING_TX_MSGS, ret);
++        }
+       }
+ 
+     } else if (!hyundai_camera_scc) {
+-- 
+2.43.0
+

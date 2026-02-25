@@ -1,0 +1,27 @@
+From 16be4d3579e89f5aeba093613a39b53e83a7862f Mon Sep 17 00:00:00 2001
+From: Farhan <13837568+mdfarhan@users.noreply.github.com>
+Date: Wed, 4 Feb 2026 19:41:22 -0500
+Subject: [PATCH] Add torque params for KIA_CARNIVAL_HEV_4TH_GEN
+
+Required for lateral control tuning. Uses same values as non-hybrid Carnival.
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+---
+ opendbc/car/torque_data/override.toml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/opendbc_repo/opendbc/car/torque_data/override.toml b/opendbc_repo/opendbc/car/torque_data/override.toml
+index 6659501d..526c1428 100644
+--- a/opendbc_repo/opendbc/car/torque_data/override.toml
++++ b/opendbc_repo/opendbc/car/torque_data/override.toml
+@@ -67,6 +67,7 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
+ "KIA_NIRO_EV_2ND_GEN" = [2.05, 2.5, 0.14]
+ "GENESIS_GV80" = [2.5, 2.5, 0.1]
+ "KIA_CARNIVAL_4TH_GEN" = [1.75, 1.75, 0.15]
++"KIA_CARNIVAL_HEV_4TH_GEN" = [1.75, 1.75, 0.15]
+ "GMC_ACADIA" = [1.6, 1.6, 0.2]
+ "LEXUS_IS_TSS2" = [2.0, 2.0, 0.1]
+ "HYUNDAI_KONA_EV_2ND_GEN" = [2.5, 2.5, 0.1]
+-- 
+2.43.0
+

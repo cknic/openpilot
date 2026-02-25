@@ -1,0 +1,408 @@
+diff --git a/common/params_keys.h b/common/params_keys.h
+index 6f27d9582..0d14bf140 100644
+--- a/common/params_keys.h
++++ b/common/params_keys.h
+@@ -59,6 +59,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
+     {"IsEngaged", {PERSISTENT, BOOL}},
+     {"IsLdwEnabled", {PERSISTENT | BACKUP, BOOL}},
+     {"IsMetric", {PERSISTENT | BACKUP, BOOL}},
++    {"HideCamera", {PERSISTENT | BACKUP, BOOL}},
+     {"IsOffroad", {CLEAR_ON_MANAGER_START, BOOL}},
+     {"IsOnroad", {PERSISTENT, BOOL}},
+     {"IsRhdDetected", {PERSISTENT, BOOL}},
+@@ -174,12 +175,14 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
+     {"OnroadUploads", {PERSISTENT | BACKUP, BOOL, "1"}},
+     {"QuickBootToggle", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"QuietMode", {PERSISTENT | BACKUP, BOOL, "0"}},
++    {"RadarTracks", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"RainbowMode", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"RocketFuel", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"ShowAdvancedControls", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"ShowTurnSignals", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"StandstillTimer", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"TrueVEgoUI", {PERSISTENT | BACKUP, BOOL, "0"}},
++    {"SteeringCustomButtonMapping", {PERSISTENT | BACKUP, INT, "0"}},
+ 
+     // MADS params
+     {"Mads", {PERSISTENT | BACKUP, BOOL, "1"}},
+@@ -214,6 +217,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
+ 
+     // sunnypilot car specific params
+     {"HyundaiLongitudinalTuning", {PERSISTENT | BACKUP, INT, "0"}},
++    {"HyundaiRadar", {PERSISTENT | BACKUP, INT, "0"}},
+     {"SubaruStopAndGo", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"SubaruStopAndGoManualParkingBrake", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"TeslaCoopSteering", {PERSISTENT | BACKUP, BOOL, "0"}},
+diff --git a/selfdrive/ui/feedback/feedbackd.py b/selfdrive/ui/feedback/feedbackd.py
+index 24f27874e..3018fbdb5 100755
+--- a/selfdrive/ui/feedback/feedbackd.py
++++ b/selfdrive/ui/feedback/feedbackd.py
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env python3
+ import cereal.messaging as messaging
++from enum import Enum
+ from openpilot.common.params import Params
+ from openpilot.common.swaglog import cloudlog
+ from cereal import car
+@@ -8,6 +9,14 @@ from openpilot.system.micd import SAMPLE_RATE, SAMPLE_BUFFER
+ FEEDBACK_MAX_DURATION = 10.0
+ ButtonType = car.CarState.ButtonEvent.Type
+ 
++# TODO-SP: Use common python enum when we move to raylib?
++CUSTOM_MAPPING_BOOKMARK = 1  # Custom button mapping value for bookmark action
++
++class ButtonPressType(Enum):
++  NONE = 'NONE'
++  LKAS = 'LKAS'
++  CUSTOM = 'CUSTOM'
++
+ 
+ def main():
+   params = Params()
+@@ -21,29 +30,25 @@ def main():
+   while True:
+     sm.update()
+     should_send_bookmark = False
++    btn_pressed = get_button_event(sm, params)
+ 
+-    # TODO: https://github.com/commaai/openpilot/issues/36015
+-    # only allow the LKAS button to record feedback when MADS is disabled
+-    if False and sm.updated['carState'] and sm['carState'].canValid and not sm['selfdriveStateSP'].mads.available:
+-      for be in sm['carState'].buttonEvents:
+-        if be.type == ButtonType.lkas:
+-          if be.pressed:
+-            if not should_record_audio:
+-              if params.get_bool("RecordAudioFeedback"):  # Start recording on first press if toggle set
+-                should_record_audio = True
+-                block_num = 0
+-                waiting_for_release = False
+-                early_stop_triggered = False
+-                cloudlog.info("LKAS button pressed - starting 10-second audio feedback")
+-              else:
+-                should_send_bookmark = True  # immediately send bookmark if toggle false
+-                cloudlog.info("LKAS button pressed - bookmarking")
+-            elif should_record_audio and not waiting_for_release:  # Wait for release of second press to stop recording early
+-              waiting_for_release = True
+-          elif waiting_for_release:  # Second press released
+-            waiting_for_release = False
+-            early_stop_triggered = True
+-            cloudlog.info("LKAS button released - ending recording early")
++    if btn_pressed is not ButtonPressType.NONE:
++      if not should_record_audio:
++        if params.get_bool("RecordAudioFeedback"):  # Start recording on first press if toggle set
++          should_record_audio = True
++          block_num = 0
++          waiting_for_release = False
++          early_stop_triggered = False
++          cloudlog.info(f"{btn_pressed.value} button pressed - starting 10-second audio feedback")
++        else:
++          should_send_bookmark = True  # immediately send bookmark if toggle false
++          cloudlog.info(f"{btn_pressed.value} button pressed - bookmarking")
++      elif should_record_audio and not waiting_for_release:  # Wait for release of second press to stop recording early
++        waiting_for_release = True
++    elif waiting_for_release:  # Second press released
++      waiting_for_release = False
++      early_stop_triggered = True
++      cloudlog.info(f"{btn_pressed.value} button released - ending recording early")
+ 
+     if should_record_audio and sm.updated['rawAudioData']:
+       raw_audio = sm['rawAudioData']
+@@ -68,5 +73,26 @@ def main():
+       pm.send('userBookmark', msg)
+ 
+ 
++def get_button_event(sm, params):
++
++  custom_button_mapping = params.get("SteeringCustomButtonMapping")
++  custom_mapped = custom_button_mapping == CUSTOM_MAPPING_BOOKMARK
++  btn_pressed = ButtonPressType.NONE
++
++  # use custom button mapping if available
++  use_custom = custom_mapped and sm.updated['carState']
++  # only allow the LKAS button to record feedback when MADS is disabled & custom button mapping is not set
++  # TODO: https://github.com/commaai/openpilot/issues/36015
++  use_lkas = False #sm.updated['carState'] and sm['carState'].canValid and not sm['selfdriveStateSP'].mads.available
++
++  if use_custom or use_lkas:
++    for be in sm['carState'].buttonEvents:
++      if use_custom and be.type == ButtonType.altButton2:
++        btn_pressed = ButtonPressType.CUSTOM if be.pressed else ButtonPressType.NONE
++      elif use_lkas and be.type == ButtonType.lkas:
++        btn_pressed = ButtonPressType.LKAS if be.pressed else ButtonPressType.NONE
++
++  return btn_pressed
++
+ if __name__ == '__main__':
+   main()
+diff --git a/selfdrive/ui/layouts/settings/toggles.py b/selfdrive/ui/layouts/settings/toggles.py
+index f5f3a4e9c..57a979f02 100644
+--- a/selfdrive/ui/layouts/settings/toggles.py
++++ b/selfdrive/ui/layouts/settings/toggles.py
+@@ -17,6 +17,7 @@ PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
+ 
+ # Description constants
+ DESCRIPTIONS = {
++  "HideCamera": tr_noop("hide camera from onroad ui"),
+   "OpenpilotEnabledToggle": tr_noop(
+     "Use the sunnypilot system for adaptive cruise control and lane keep driver assistance. " +
+     "Your attention is required at all times to use this feature."
+@@ -46,6 +47,12 @@ class TogglesLayout(Widget):
+ 
+     # param, title, desc, icon, needs_restart
+     self._toggle_defs = {
++      "HideCamera": (
++        lambda: tr("Hide Camera"),
++        DESCRIPTIONS["HideCamera"],
++        "chffr_wheel.png",
++        False,
++      ),
+       "OpenpilotEnabledToggle": (
+         lambda: tr("Enable sunnypilot"),
+         DESCRIPTIONS["OpenpilotEnabledToggle"],
+diff --git a/selfdrive/ui/mici/layouts/settings/toggles.py b/selfdrive/ui/mici/layouts/settings/toggles.py
+index 1266311a1..6501613ab 100644
+--- a/selfdrive/ui/mici/layouts/settings/toggles.py
++++ b/selfdrive/ui/mici/layouts/settings/toggles.py
+@@ -25,8 +25,14 @@ class TogglesLayoutMici(NavWidget):
+     record_front = BigParamControl("record & upload driver camera", "RecordFront", toggle_callback=restart_needed_callback)
+     record_mic = BigParamControl("record & upload mic audio", "RecordAudio", toggle_callback=restart_needed_callback)
+     enable_openpilot = BigParamControl("enable sunnypilot", "OpenpilotEnabledToggle", toggle_callback=restart_needed_callback)
++    hide_camera = BigParamControl("hide camera", "HideCamera")
++    hyundai_radar = BigMultiParamToggle("hyundai radar", "HyundaiRadar", ["off", "lead only", "full radar"])
++    radar_tracks = BigParamControl("radar tracks", "RadarTracks")
+ 
+     self._scroller = Scroller([
++      radar_tracks,
++      hide_camera,
++      hyundai_radar,
+       self._personality_toggle,
+       self._experimental_btn,
+       is_metric_toggle,
+@@ -39,6 +45,9 @@ class TogglesLayoutMici(NavWidget):
+ 
+     # Toggle lists
+     self._refresh_toggles = (
++      ("HideCamera", hide_camera),
++      ("HyundaiRadar", hyundai_radar),
++      ("RadarTracks", radar_tracks),
+       ("ExperimentalMode", self._experimental_btn),
+       ("IsMetric", is_metric_toggle),
+       ("IsLdwEnabled", ldw_toggle),
+diff --git a/selfdrive/ui/mici/onroad/augmented_road_view.py b/selfdrive/ui/mici/onroad/augmented_road_view.py
+index f8aee7969..880aadee5 100644
+--- a/selfdrive/ui/mici/onroad/augmented_road_view.py
++++ b/selfdrive/ui/mici/onroad/augmented_road_view.py
+@@ -218,6 +218,8 @@ class AugmentedRoadView(CameraView):
+ 
+     # Render the base camera view
+     super()._render(self._content_rect)
++    if ui_state.hide_camera:
++      rl.draw_rectangle_rec(self._content_rect, rl.BLACK)
+ 
+     # Draw all UI overlays
+     self._model_renderer.render(self._content_rect)
+diff --git a/selfdrive/ui/mici/onroad/driver_state.py b/selfdrive/ui/mici/onroad/driver_state.py
+index 356d7ac83..0787c9a01 100644
+--- a/selfdrive/ui/mici/onroad/driver_state.py
++++ b/selfdrive/ui/mici/onroad/driver_state.py
+@@ -180,6 +180,13 @@ class DriverStateRenderer(Widget):
+       return
+ 
+     pitch, yaw, roll = driver_orient
++
++    # Correct for driver position relative to center-mounted camera
++    yaw_offset = math.radians(20)
++    if self._is_rhd:
++      yaw += yaw_offset
++    else:
++      yaw -= yaw_offset
+     pitch = self._pitch_filter.update(pitch)
+     yaw = self._yaw_filter.update(yaw)
+ 
+diff --git a/selfdrive/ui/mici/onroad/model_renderer.py b/selfdrive/ui/mici/onroad/model_renderer.py
+index ca051c6d9..710e97d6e 100644
+--- a/selfdrive/ui/mici/onroad/model_renderer.py
++++ b/selfdrive/ui/mici/onroad/model_renderer.py
+@@ -153,6 +153,10 @@ class ModelRenderer(Widget, ModelRendererSP):
+       self._draw_lane_lines()
+       self._draw_path(sm)
+ 
++    if ui_state.radar_tracks and sm.valid['liveTracks'] and sm.recv_frame['liveTracks'] >= ui_state.started_frame:
++      self.radar_tracks.draw_radar_tracks(sm['liveTracks'], self._map_to_screen, self._path_offset_z, track_size=3)
++      return
++
+     # if render_lead_indicator and radar_state:
+     #   self._draw_lead_indicator()
+ 
+diff --git a/selfdrive/ui/onroad/augmented_road_view.py b/selfdrive/ui/onroad/augmented_road_view.py
+index 76e7b078d..f07c5b51b 100644
+--- a/selfdrive/ui/onroad/augmented_road_view.py
++++ b/selfdrive/ui/onroad/augmented_road_view.py
+@@ -90,6 +90,8 @@ class AugmentedRoadView(CameraView, AugmentedRoadViewSP):
+ 
+     # Render the base camera view
+     super()._render(rect)
++    if ui_state.hide_camera:
++      rl.draw_rectangle_rec(self._content_rect, rl.BLACK)
+ 
+     # Draw all UI overlays
+     self.model_renderer.render(self._content_rect)
+diff --git a/selfdrive/ui/onroad/model_renderer.py b/selfdrive/ui/onroad/model_renderer.py
+index 353cc5aa4..61568c2ea 100644
+--- a/selfdrive/ui/onroad/model_renderer.py
++++ b/selfdrive/ui/onroad/model_renderer.py
+@@ -135,6 +135,10 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
+     self._draw_lane_lines()
+     self._draw_path(sm)
+ 
++    if ui_state.radar_tracks and sm.valid['liveTracks'] and sm.recv_frame['liveTracks'] >= ui_state.started_frame:
++      self.radar_tracks.draw_radar_tracks(sm['liveTracks'], self._map_to_screen, self._path_offset_z)
++      return
++
+     if render_lead_indicator and radar_state:
+       self._draw_lead_indicator()
+       self.chevron_metrics.draw_lead_status(sm, radar_state, self._rect, self._lead_vehicles)
+diff --git a/selfdrive/ui/sunnypilot/onroad/model_renderer.py b/selfdrive/ui/sunnypilot/onroad/model_renderer.py
+index 5d7899766..cfea9ba7a 100644
+--- a/selfdrive/ui/sunnypilot/onroad/model_renderer.py
++++ b/selfdrive/ui/sunnypilot/onroad/model_renderer.py
+@@ -6,9 +6,12 @@ See the LICENSE.md file in the root directory for more details.
+ """
+ from openpilot.selfdrive.ui.sunnypilot.onroad.chevron_metrics import ChevronMetrics
+ from openpilot.selfdrive.ui.sunnypilot.onroad.rainbow_path import RainbowPath
++from openpilot.selfdrive.ui.sunnypilot.onroad.radar_tracks import RadarTracks
+ 
+ 
+ class ModelRendererSP:
+   def __init__(self):
+     self.rainbow_path = RainbowPath()
+     self.chevron_metrics = ChevronMetrics()
++    self.radar_tracks = RadarTracks()
++
+diff --git a/selfdrive/ui/sunnypilot/onroad/speed_limit.py b/selfdrive/ui/sunnypilot/onroad/speed_limit.py
+index e8b5c5cfc..a0b5ea393 100644
+--- a/selfdrive/ui/sunnypilot/onroad/speed_limit.py
++++ b/selfdrive/ui/sunnypilot/onroad/speed_limit.py
+@@ -22,8 +22,6 @@ from openpilot.system.ui.widgets import Widget
+ METER_TO_FOOT = 3.28084
+ METER_TO_MILE = 0.000621371
+ AHEAD_THRESHOLD = 5
+-SET_SPEED_NA = 255
+-KM_TO_MILE = 0.621371
+ 
+ AssistState = custom.LongitudinalPlanSP.SpeedLimit.AssistState
+ SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
+@@ -60,11 +58,8 @@ class SpeedLimitRenderer(Widget):
+     self.speed_limit_ahead_frame = 0
+ 
+     self.assist_frame = 0
+-    self.is_cruise_set: bool = False
+-    self.is_cruise_available: bool = True
+-    self.set_speed: float = SET_SPEED_NA
+-    self.speed: float = 0.0
+-    self.v_ego_cluster_seen: bool = False
++    self.speed = 0.0
++    self.set_speed = 0.0
+ 
+     self.font_bold = gui_app.font(FontWeight.BOLD)
+     self.font_demi = gui_app.font(FontWeight.SEMI_BOLD)
+@@ -82,8 +77,6 @@ class SpeedLimitRenderer(Widget):
+   def update(self):
+     sm = ui_state.sm
+     if sm.recv_frame["carState"] < ui_state.started_frame:
+-      self.set_speed = SET_SPEED_NA
+-      self.speed = 0.0
+       return
+ 
+     if sm.updated["longitudinalPlanSP"]:
+@@ -113,21 +106,9 @@ class SpeedLimitRenderer(Widget):
+ 
+       self.speed_limit_ahead_dist_prev = self.speed_limit_ahead_dist
+ 
+-    controls_state = sm['controlsState']
+-    car_state = sm["carState"]
+-
+-    v_cruise_cluster = car_state.vCruiseCluster
+-    self.set_speed = (
+-      controls_state.vCruiseDEPRECATED if v_cruise_cluster == 0.0 else v_cruise_cluster
+-    )
+-    self.is_cruise_set = 0 < self.set_speed < SET_SPEED_NA
+-    self.is_cruise_available = self.set_speed != -1
+-
+-    if self.is_cruise_set and not ui_state.is_metric:
+-      self.set_speed *= KM_TO_MILE
+-
+-    self.v_ego_cluster_seen = self.v_ego_cluster_seen or car_state.vEgoCluster != 0.0
+-    v_ego = car_state.vEgoCluster if self.v_ego_cluster_seen else car_state.vEgo
++    cs = sm["carState"]
++    self.set_speed = cs.cruiseState.speed * self.speed_conv
++    v_ego = cs.vEgoCluster if cs.vEgoCluster != 0.0 else cs.vEgo
+     self.speed = max(0.0, v_ego * self.speed_conv)
+ 
+   @staticmethod
+diff --git a/selfdrive/ui/sunnypilot/ui_state.py b/selfdrive/ui/sunnypilot/ui_state.py
+index 4d26e138b..c2c5abecb 100644
+--- a/selfdrive/ui/sunnypilot/ui_state.py
++++ b/selfdrive/ui/sunnypilot/ui_state.py
+@@ -143,6 +143,8 @@ class UIStateSP:
+     self.true_v_ego_ui = self.params.get_bool("TrueVEgoUI")
+     self.turn_signals = self.params.get_bool("ShowTurnSignals")
+     self.boot_offroad_mode = self.params.get("DeviceBootMode", return_default=True)
++    self.hide_camera = self.params.get("HideCamera")
++    self.radar_tracks = self.params.get_bool("RadarTracks")
+ 
+ 
+ class DeviceSP:
+diff --git a/selfdrive/ui/ui_state.py b/selfdrive/ui/ui_state.py
+index f7a5d44d9..4cd70a503 100644
+--- a/selfdrive/ui/ui_state.py
++++ b/selfdrive/ui/ui_state.py
+@@ -60,6 +60,7 @@ class UIState(UIStateSP):
+         "carControl",
+         "liveParameters",
+         "rawAudioData",
++        "liveTracks",
+       ] + self.sm_services_ext
+     )
+ 
+diff --git a/sunnypilot/selfdrive/car/interfaces.py b/sunnypilot/selfdrive/car/interfaces.py
+index a93f5724b..bd920729e 100644
+--- a/sunnypilot/selfdrive/car/interfaces.py
++++ b/sunnypilot/selfdrive/car/interfaces.py
+@@ -115,6 +115,7 @@ def initialize_params(params) -> list[dict[str, Any]]:
+   # hyundai
+   keys.extend([
+     "HyundaiLongitudinalTuning",
++    "HyundaiRadar",
+   ])
+ 
+   # subaru
+diff --git a/selfdrive/ui/sunnypilot/onroad/radar_tracks.py b/selfdrive/ui/sunnypilot/onroad/radar_tracks.py
+new file mode 100644
+index 000000000..1f4da8023
+--- /dev/null
++++ b/selfdrive/ui/sunnypilot/onroad/radar_tracks.py
+@@ -0,0 +1,23 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
++import math
++import pyray as rl
++
++
++class RadarTracks:
++  def draw_radar_tracks(self, live_tracks, map_to_screen, path_offset_z, track_size=6):
++    for track in live_tracks.points:
++      d_rel, y_rel, v_rel, a_rel = track.dRel, track.yRel, track.vRel, track.aRel
++      if not (math.isfinite(d_rel) and math.isfinite(y_rel) and math.isfinite(v_rel) and math.isfinite(a_rel)):
++        continue
++
++      pt = map_to_screen(d_rel, -y_rel, path_offset_z)
++      if pt is None:
++        continue
++
++      x, y = pt
++      rl.draw_circle(int(x), int(y), track_size, rl.Color(0, 255, 64, 255))

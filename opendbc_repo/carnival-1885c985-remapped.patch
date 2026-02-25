@@ -1,0 +1,76 @@
+From 1885c985a711ddc9af4c8661cffe17dbc999c6c1 Mon Sep 17 00:00:00 2001
+From: Farhan <farhanmdpes@gmail.com>
+Date: Wed, 4 Feb 2026 17:25:28 -0500
+Subject: [PATCH] Add Kia Carnival Hybrid 4th Gen (2025-26) support
+
+- Add KIA_CARNIVAL_HEV_4TH_GEN fingerprint with camera and radar FW versions
+- Add car definition with HYBRID flag for lane centering + stock ACC
+- Add to CANFD_FUZZY_WHITELIST for proper fuzzy matching
+
+Fingerprints from 2026 Kia Carnival SXP Hybrid:
+- Camera: KA4HMFC AT USA LHD (99210-R0500, 99210-R0700)
+- Radar: KAhe RDR (99110-ES500)
+
+Harness options:
+- hyundai_a: Standard harness
+- hyundai_q: For HDA II equipped vehicles
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+---
+ opendbc/car/hyundai/fingerprints.py |  9 +++++++++
+ opendbc/car/hyundai/values.py       | 12 ++++++++++--
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/opendbc_repo/opendbc/car/hyundai/fingerprints.py b/opendbc_repo/opendbc/car/hyundai/fingerprints.py
+index a71168c3..e899ea88 100644
+--- a/opendbc_repo/opendbc/car/hyundai/fingerprints.py
++++ b/opendbc_repo/opendbc/car/hyundai/fingerprints.py
+@@ -1231,6 +1231,15 @@ FW_VERSIONS = {
+       b'\xf1\x00KA4c SCC FHCUP      1.00 1.01 99110-I4000         ',
+     ],
+   },
++  CAR.KIA_CARNIVAL_HEV_4TH_GEN: {
++    (Ecu.fwdCamera, 0x7c4, None): [
++      b'\xf1\x00KA4HMFC  AT USA LHD 1.00 1.05 99210-R0500 240305',
++      b'\xf1\x00KA4HMFC  AT USA LHD 1.00 1.00 99210-R0700 250324',
++    ],
++    (Ecu.fwdRadar, 0x7d0, None): [
++      b'\xf1\x00KAhe RDR -----      1.00 1.01 99110-ES500         ',
++    ],
++  },
+   CAR.KIA_K8_HEV_1ST_GEN: {
+     (Ecu.fwdCamera, 0x7c4, None): [
+       b'\xf1\x00GL3HMFC  AT KOR LHD 1.00 1.03 99211-L8000 210907',
+diff --git a/opendbc_repo/opendbc/car/hyundai/values.py b/opendbc_repo/opendbc/car/hyundai/values.py
+index ca23fb9b..b0da8815 100644
+--- a/opendbc_repo/opendbc/car/hyundai/values.py
++++ b/opendbc_repo/opendbc/car/hyundai/values.py
+@@ -545,6 +545,15 @@ class CAR(Platforms):
+     CarSpecs(mass=2087, wheelbase=3.09, steerRatio=14.23),
+     flags=HyundaiFlags.RADAR_SCC,
+   )
++  KIA_CARNIVAL_HEV_4TH_GEN = HyundaiCanFDPlatformConfig(
++    [
++      HyundaiCarDocs("Kia Carnival Hybrid 2025-26", car_parts=CarParts.common([CarHarness.hyundai_a])),
++      HyundaiCarDocs("Kia Carnival Hybrid (with HDA II) 2025-26", "Highway Driving Assist II",
++                     car_parts=CarParts.common([CarHarness.hyundai_q])),
++    ],
++    CarSpecs(mass=2253, wheelbase=3.09, steerRatio=14.23),
++    flags=HyundaiFlags.HYBRID,
++  )
+ 
+   # Genesis
+   GENESIS_GV60_EV_1ST_GEN = HyundaiCanFDPlatformConfig(
+@@ -750,8 +759,7 @@ PART_NUMBER_FW_PATTERN = re.compile(b'(?<=[0-9][.,][0-9]{2} )([0-9]{5}[-/]?[A-Z]
+ 
+ # We've seen both ICE and hybrid for these platforms, and they have hybrid descriptors (e.g. MQ4 vs MQ4H)
+ CANFD_FUZZY_WHITELIST = {CAR.KIA_SORENTO_4TH_GEN, CAR.KIA_SORENTO_HEV_4TH_GEN, CAR.KIA_K8_HEV_1ST_GEN,
+-                         # TODO: the hybrid variant is not out yet
+-                         CAR.KIA_CARNIVAL_4TH_GEN}
++                         CAR.KIA_CARNIVAL_4TH_GEN, CAR.KIA_CARNIVAL_HEV_4TH_GEN}
+ 
+ # List of ECUs expected to have platform codes, camera and radar should exist on all cars
+ # TODO: use abs, it has the platform code and part number on many platforms
+-- 
+2.43.0
+
