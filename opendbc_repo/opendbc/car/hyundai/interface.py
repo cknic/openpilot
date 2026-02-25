@@ -155,8 +155,7 @@ class CarInterface(CarInterfaceBase):
       ret.steerActuatorDelay = 0.2
 
     elif candidate in (CAR.KIA_CARNIVAL_4TH_GEN, CAR.KIA_CARNIVAL_HEV_4TH_GEN):
-      ret.enableLong = True              # force longitudinal on
-      ret.radarUnavailable = True         # tell openpilot the radar is unavailable
+      ret.radarUnavailable = True         # bypass radar for openpilot longitudinal
 
     # Dashcam cars are missing a test route, or otherwise need validation
     # TODO: Optima Hybrid 2017 uses a different SCC12 checksum
