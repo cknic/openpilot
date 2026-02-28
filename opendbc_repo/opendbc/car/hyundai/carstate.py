@@ -336,6 +336,13 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
         # this message is 50Hz but the ECU frequently stops transmitting for ~0.5s
         ("CRUISE_BUTTONS", 1)
       ]
+    if CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+      # These messages are read by angle steering code but may not exist on all cars (e.g. Carnival).
+      # NaN frequency marks them as ignore_alive so they don't affect canValid.
+      msgs += [
+        ("HOD_FD_01_100ms", float('nan')),
+        ("IMU_01_10ms", float('nan')),
+      ]
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CanBus(CP).ECAN),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus(CP).CAM),
