@@ -65,6 +65,9 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
 
     self.cruise_info = {}
 
+    self.msg_161 = {}
+    self.msg_162 = {}
+
     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
     self.cluster_speed = 0
     self.cluster_speed_counter = CLUSTER_SAMPLE_RATE
@@ -273,6 +276,10 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
         ret.leftBlindspot = cp.vl["BLINDSPOTS_REAR_CORNERS"]["FL_INDICATOR"] != 0
         ret.rightBlindspot = cp.vl["BLINDSPOTS_REAR_CORNERS"]["FR_INDICATOR"] != 0
 
+    if self.CP.flags & HyundaiFlags.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEERING:
+      self.msg_161 = copy.copy(cp_cam.vl["CCNC_0x161"])
+      self.msg_162 = copy.copy(cp_cam.vl["CCNC_0x162"])
+
     # cruise state
     # CAN FD cars enable on main button press, set available if no TCS faults preventing engagement
     ret.cruiseState.available = cp.vl["TCS"]["ACCEnable"] == 0
@@ -324,6 +331,7 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
 
   def get_can_parsers_canfd(self, CP):
     msgs = []
+    cam_msgs = []
     if not (CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS):
       # TODO: this can be removed once we add dynamic support to vl_all
       msgs += [
@@ -332,9 +340,14 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
       ]
     if CP.enableBsm:
       msgs += [("BLINDSPOTS_REAR_CORNERS", 20)]
+    if CP.flags & HyundaiFlags.CCNC and not CP.flags & HyundaiFlags.CANFD_LKA_STEERING:
+      cam_msgs += [
+        ("CCNC_0x161", 20),
+        ("CCNC_0x162", 20),
+      ]
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CanBus(CP).ECAN),
-      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus(CP).CAM),
+      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_msgs, CanBus(CP).CAM),
     }
 
   def get_can_parsers(self, CP, CP_SP):

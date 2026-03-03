@@ -133,6 +133,8 @@ class HyundaiFlags(IntFlag):
 
   ALT_LIMITS_2 = 2 ** 26
 
+  CCNC = 2 ** 27
+
 
 @dataclass
 class HyundaiCarDocs(CarDocs):
@@ -548,7 +550,7 @@ class CAR(Platforms):
       HyundaiCarDocs("Kia Carnival (China only) 2023", car_parts=CarParts.common([CarHarness.hyundai_k])),
     ],
     CarSpecs(mass=2087, wheelbase=3.09, steerRatio=14.23),
-    flags=HyundaiFlags.RADAR_SCC,
+    flags=HyundaiFlags.RADAR_SCC | HyundaiFlags.CCNC,
   )
   KIA_CARNIVAL_HEV_4TH_GEN = HyundaiCanFDPlatformConfig(
     [
@@ -557,7 +559,7 @@ class CAR(Platforms):
                      car_parts=CarParts.common([CarHarness.hyundai_q])),
     ],
     CarSpecs(mass=2253, wheelbase=3.09, steerRatio=14.23),
-    flags=HyundaiFlags.RADAR_SCC,
+    flags=HyundaiFlags.RADAR_SCC | HyundaiFlags.CCNC,
   )
 
   # Genesis
