@@ -151,6 +151,9 @@ class CarInterface(CarInterfaceBase):
 
     # Car specific configuration overrides
 
+    if candidate in (CAR.KIA_CARNIVAL_4TH_GEN, CAR.KIA_CARNIVAL_HEV_4TH_GEN):
+      ret.steerActuatorDelay = 0.35
+
     if candidate == CAR.KIA_OPTIMA_G4_FL:
       ret.steerActuatorDelay = 0.2
 
