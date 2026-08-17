@@ -17,7 +17,7 @@ class CarControllerParams:
   ACCEL_MIN = -3.5 # m/s
   ACCEL_MAX = 2.0 # m/s
 
-  def __init__(self, CP):
+  def __init__(self, CP, vEgoRaw=100.):
     self.STEER_DELTA_UP = 3
     self.STEER_DELTA_DOWN = 7
     self.STEER_DRIVER_ALLOWANCE = 50
@@ -34,10 +34,16 @@ class CarControllerParams:
       self.STEER_DELTA_UP = 2
       self.STEER_DELTA_DOWN = 3
 
-      # Carnival: modest delta increase for faster torque ramp in curves
+      # Carnival: StarPilot-style limits — higher ceiling, speed-dependent ramp
+      # (proven on 2025 Carnival via StarPilot: 409 max, 10/8 deltas below ~34 mph)
       if CP.carFingerprint in (CAR.KIA_CARNIVAL_4TH_GEN, CAR.KIA_CARNIVAL_HEV_4TH_GEN):
-        self.STEER_DELTA_UP = 3
-        self.STEER_DELTA_DOWN = 4
+        self.STEER_MAX = 409
+        if vEgoRaw < 15.0:  # below ~34 mph - more aggressive for tight turns
+          self.STEER_DELTA_UP = 10
+          self.STEER_DELTA_DOWN = 8
+        else:
+          self.STEER_DELTA_UP = 2
+          self.STEER_DELTA_DOWN = 3
 
     # To determine the limit for your car, find the maximum value that the stock LKAS will request.
     # If the max stock LKAS request is <384, add your car to this list.

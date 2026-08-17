@@ -68,6 +68,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.last_button_frame = 0
 
   def update(self, CC, CC_SP, CS, now_nanos):
+    # Refresh speed-dependent steering limits (Carnival: aggressive ramp below ~34 mph)
+    if self.car_fingerprint in (CAR.KIA_CARNIVAL_4TH_GEN, CAR.KIA_CARNIVAL_HEV_4TH_GEN):
+      self.params = CarControllerParams(self.CP, CS.out.vEgoRaw)
     EsccCarController.update(self, CS)
     LeadDataCarController.update(self, CC_SP)
     MadsCarController.update(self, self.CP, CC, CC_SP, self.frame)
