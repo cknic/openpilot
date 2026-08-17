@@ -79,6 +79,7 @@ class HyundaiSafetyFlags(IntFlag):
   CANFD_LKA_STEERING_ALT = 128
   FCEV_GAS = 256
   ALT_LIMITS_2 = 512
+  CCNC = 32768
 
 
 class HyundaiFlags(IntFlag):
@@ -138,6 +139,11 @@ class HyundaiFlags(IntFlag):
   FCEV = 2 ** 25
 
   ALT_LIMITS_2 = 2 ** 26
+
+  # ccNC (Connected Car Navigation Cockpit) cars: 2025+ infotainment/cluster architecture.
+  # ADAS display state lives in CCNC_0x161/0x162; openpilot must rewrite these to keep
+  # the cluster coherent when controlling the car (ported from StarPilot).
+  CCNC = 2 ** 27
 
 
 @dataclass
