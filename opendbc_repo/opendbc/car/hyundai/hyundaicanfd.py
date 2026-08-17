@@ -1,6 +1,7 @@
 import copy
 import numpy as np
 from opendbc.car import CanBusBase
+from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.crc import CRC16_XMODEM
 from opendbc.car.hyundai.values import HyundaiFlags
 from opendbc.sunnypilot.car.hyundai.lead_data_ext import CanFdLeadData
@@ -136,6 +137,111 @@ def create_lfahda_cluster(packer, CAN, enabled, lfa_icon):
     "LFA_ICON": lfa_icon,
   }
   return packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values)
+
+
+def create_ccnc(packer, CAN, openpilot_longitudinal, enabled, hud, left_blinker, right_blinker, msg_161, msg_162, msg_1b5,
+                is_metric, out, main_cruise_enabled, lfa_icon):
+  """Rewrite ccNC cluster ADAS display messages (0x161/0x162) so the 2025+ dash shows
+  coherent state while openpilot controls the car. Ported from StarPilot (firestar5683)."""
+  msg_161 = dict(msg_161)
+  msg_162 = dict(msg_162)
+
+  for fault in ("FAULT_LSS", "FAULT_HDA", "FAULT_DAS", "FAULT_LFA", "FAULT_DAW", "FAULT_ESS"):
+    if fault in msg_162:
+      msg_162[fault] = 0
+
+  if msg_161.get("ALERTS_2") == 5:
+    msg_161.update({"ALERTS_2": 0, "SOUNDS_2": 0})
+  if msg_161.get("ALERTS_3") == 17:
+    msg_161["ALERTS_3"] = 0
+  if msg_161.get("ALERTS_5") in (2, 5):
+    msg_161["ALERTS_5"] = 0
+  if msg_161.get("SOUNDS_4") == 2 and msg_161.get("LFA_ICON") in (3, 0):
+    msg_161["SOUNDS_4"] = 0
+
+  lane_change_speed_min = 8.9408
+  any_blinker = left_blinker or right_blinker
+  curvature = {i: (31 if i == -1 else 13 - abs(i + 15)) if i < 0 else 15 + i for i in range(-15, 16)}
+
+  msg_161.update({
+    "DAW_ICON": 0,
+    "LKA_ICON": 0,
+    "LFA_ICON": 2 if lfa_icon else 0,
+    "CENTERLINE": 1 if lfa_icon else 0,
+    "LANELINE_CURVATURE": curvature.get(max(-15, min(int(out.steeringAngleDeg / 4.5), 15)), 14) if lfa_icon and not any_blinker else 15,
+    "LANELINE_LEFT": 0 if not lfa_icon else 1 if not hud.leftLaneVisible else 4 if hud.leftLaneDepart else 6 if any_blinker else 2,
+    "LANELINE_RIGHT": 0 if not lfa_icon else 1 if not hud.rightLaneVisible else 4 if hud.rightLaneDepart else 6 if any_blinker else 2,
+    "LCA_LEFT_ICON": 0 if not lfa_icon or out.vEgo < lane_change_speed_min else 1 if out.leftBlindspot else 2 if any_blinker else 4,
+    "LCA_RIGHT_ICON": 0 if not lfa_icon or out.vEgo < lane_change_speed_min else 1 if out.rightBlindspot else 2 if any_blinker else 4,
+    "LCA_LEFT_ARROW": 2 if left_blinker else 0,
+    "LCA_RIGHT_ARROW": 2 if right_blinker else 0,
+  })
+
+  if lfa_icon and any_blinker and msg_1b5:
+    left_lane_raw = msg_1b5.get("Info_LftLnPosVal", 0)
+    right_lane_raw = msg_1b5.get("Info_RtLnPosVal", 0)
+    scale_per_m = 15 / 1.7
+    left_lane = abs(int(round(15 + (left_lane_raw - 1.7) * scale_per_m)))
+    right_lane = abs(int(round(15 + (right_lane_raw - 1.7) * scale_per_m)))
+
+    if msg_1b5.get("Info_LftLnQualSta") not in (2, 3):
+      left_lane = 0
+    if msg_1b5.get("Info_RtLnQualSta") not in (2, 3):
+      right_lane = 0
+
+    if left_lane_raw == -2.0248375:
+      left_lane = 30 - right_lane
+    if right_lane_raw == 2.0248375:
+      right_lane = 30 - left_lane
+
+    if left_lane_raw == right_lane_raw == 0:
+      left_lane = right_lane = 15
+    elif left_lane_raw == 0:
+      left_lane = 30 - right_lane
+    elif right_lane_raw == 0:
+      right_lane = 30 - left_lane
+
+    total = left_lane + right_lane
+    if total == 0:
+      left_lane = right_lane = 15
+    else:
+      left_lane = round((left_lane / total) * 30)
+      right_lane = 30 - left_lane
+
+    msg_161["LANELINE_LEFT_POSITION"] = left_lane
+    msg_161["LANELINE_RIGHT_POSITION"] = right_lane
+
+  if hud.leftLaneDepart or hud.rightLaneDepart:
+    if "VIBRATE" in msg_162:
+      msg_162["VIBRATE"] = 1
+
+  if openpilot_longitudinal:
+    if msg_161.get("ALERTS_3") in (1, 2, 3, 4, 7, 8, 9, 10):
+      msg_161["ALERTS_3"] = 0
+    if msg_161.get("ALERTS_5") == 4:
+      msg_161["ALERTS_5"] = 0
+    if msg_161.get("SOUNDS_3") == 5:
+      msg_161["SOUNDS_3"] = 0
+
+    cruise_speed = round(out.vCruiseCluster * (1 if is_metric else CV.KPH_TO_MPH))
+    msg_161.update({
+      "SETSPEED": 3 if enabled else 1,
+      "SETSPEED_HUD": 0 if not main_cruise_enabled else 2 if enabled else 1,
+      "SETSPEED_SPEED": 255 if not main_cruise_enabled else (40 if is_metric else 25) if cruise_speed > (145 if is_metric else 90) else cruise_speed,
+      "DISTANCE": hud.leadDistanceBars,
+      "DISTANCE_SPACING": 0 if not main_cruise_enabled else 1 if enabled else 3,
+      "DISTANCE_LEAD": 0 if not main_cruise_enabled else 2 if enabled and hud.leadVisible else 1 if hud.leadVisible else 0,
+      "DISTANCE_CAR": 0 if not main_cruise_enabled else 2 if enabled else 1,
+      "SLA_ICON": 0,
+      "NAV_ICON": 0,
+      "TARGET": 0,
+    })
+    if "LEAD" in msg_162:
+      msg_162["LEAD"] = 0 if not main_cruise_enabled else 2 if enabled else 1
+    if msg_1b5 and "LEAD_DISTANCE" in msg_162:
+      msg_162["LEAD_DISTANCE"] = msg_1b5.get("Longitudinal_Distance", 0)
+
+  return [packer.make_can_msg(msg, CAN.ECAN, values) for msg, values in (("CCNC_0x161", msg_161), ("CCNC_0x162", msg_162))]
 
 
 def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_override, set_speed, hud_control,

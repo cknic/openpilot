@@ -569,7 +569,7 @@ class CAR(Platforms):
                      car_parts=CarParts.common([CarHarness.hyundai_q])),
     ],
     CarSpecs(mass=2253, wheelbase=3.09, steerRatio=14.23),
-    flags=HyundaiFlags.RADAR_SCC,
+    flags=HyundaiFlags.CCNC,  # 2025+ ccNC architecture: camera SCC, cluster msgs need rewriting (radar FW is "RDR -----")
   )
 
   # Genesis

@@ -28,6 +28,9 @@ BUTTONS_DICT = {Buttons.RES_ACCEL: ButtonType.accelCruise, Buttons.SET_DECEL: Bu
 
 class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
   def __init__(self, CP, CP_SP):
+    self.msg_161 = {}
+    self.msg_162 = {}
+    self.msg_1b5 = {}
     CarStateBase.__init__(self, CP, CP_SP)
     EsccCarStateBase.__init__(self)
     MadsCarState.__init__(self, CP, CP_SP)
@@ -306,6 +309,11 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     if self.CP.flags & HyundaiFlags.CANFD_LKA_STEERING:
       self.lfa_block_msg = copy.copy(cp_cam.vl["CAM_0x362"] if self.CP.flags & HyundaiFlags.CANFD_LKA_STEERING_ALT
                                           else cp_cam.vl["CAM_0x2a4"])
+
+    if self.CP.flags & HyundaiFlags.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEERING:
+      self.msg_161 = copy.copy(cp_cam.vl["CCNC_0x161"])
+      self.msg_162 = copy.copy(cp_cam.vl["CCNC_0x162"])
+      self.msg_1b5 = copy.copy(cp_cam.vl["FR_CMR_03_50ms"])
 
     MadsCarState.update_mads_canfd(self, ret, can_parsers)
 
